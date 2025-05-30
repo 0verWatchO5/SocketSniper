@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import socket
 import ssl
 import json
@@ -11,13 +13,100 @@ import threading
 from datetime import datetime
 from collections import defaultdict
 import time
-from rich.console import Console
-from rich.text import Text
+import sys # For checking if output is a TTY
+
+# Rich library imports
+try:
+    from rich.console import Console
+    from rich.table import Table, Column
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TaskProgressColumn
+    from rich.live import Live
+    from rich.style import Style
+    from rich.box import ROUNDED, HEAVY_HEAD
+    from rich.padding import Padding
+    from rich.markup import escape
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    # Basic fallback if Rich is not installed
+    class ConsoleFallback:
+        def __init__(self, record=False, force_terminal=None): # Add force_terminal to match Rich Console
+            pass
+        def print(self, *args, **kwargs):
+            plain_text = []
+            for arg in args:
+                if hasattr(arg, 'plain') and callable(arg.plain): # For Text objects if used in fallback
+                    plain_text.append(arg.plain)
+                elif isinstance(arg, (PanelFallback, TableFallback)): # If we pass our fallback objects
+                    arg.display() # Call their display method
+                    continue
+                else:
+                    plain_text.append(str(arg))
+            if plain_text: # Only print if there's something to print
+                 print(" ".join(plain_text))
+        def rule(self, title=""):
+            print(f"\n--- {title} ---" if title else "\n" + "-" * 70)
+
+    class PanelFallback:
+        def __init__(self, content, title="", subtitle="", **kwargs):
+            self.content = content
+            self.title = title
+            self.subtitle = subtitle
+        def display(self):
+            _title = f"{self.title}" if self.title else ""
+            _subtitle = f" ({self.subtitle})" if self.subtitle else ""
+            print(f"\n--- {_title}{_subtitle} ---")
+            if isinstance(self.content, str):
+                print(self.content)
+            elif hasattr(self.content, 'display'): # For nested TableFallback
+                self.content.display()
+
+
+    class TableFallback:
+        def __init__(self, title="", **kwargs):
+            self.title = title
+            self.columns = []
+            self.rows = []
+            self.show_header = True
+            self.box = None # To match Rich Table attributes
+
+        def add_column(self, header, **kwargs):
+            self.columns.append(header)
+
+        def add_row(self, *args):
+            self.rows.append(args)
+        
+        def display(self):
+            if self.title:
+                print(f"\n=== {self.title} ===")
+            if self.show_header and self.columns:
+                print(" | ".join(str(c) for c in self.columns))
+                print("-" * (sum(len(str(c)) for c in self.columns) + (len(self.columns) -1) * 3))
+            for row in self.rows:
+                print(" | ".join(str(item) for item in row))
+
+
+    console_instance = ConsoleFallback() # Use a consistent name
+    Panel = PanelFallback # type: ignore
+    Table = TableFallback # type: ignore
+    Text = str # Fallback Text to simple string
+    Padding = lambda text, pad: text # No padding for fallback
+
+# --- Global console instance ---
+# Determine if we should force Rich to believe it's a terminal (e.g., for consistent output in CI/pipes if desired)
+# By default, Rich auto-detects. This setup allows overriding if needed.
+force_rich_terminal = None # Set to True/False to override, None for auto-detection
+if RICH_AVAILABLE:
+    console = Console(record=False, force_terminal=force_rich_terminal)
+else:
+    console = console_instance # Use the fallback
 
 # --- Configuration ---
-DEFAULT_TCP_TIMEOUT = 1.0  # Default timeout for TCP connections in seconds
-DEFAULT_UDP_TIMEOUT = 2.0  # Default timeout for UDP probes in seconds
-MAX_BANNER_SIZE = 1024     # Max size of banner to grab
+DEFAULT_TCP_TIMEOUT = 1.0
+DEFAULT_UDP_TIMEOUT = 2.0
+MAX_BANNER_SIZE = 1024
 COMMON_TCP_PORTS = {
     21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
     110: "POP3", 143: "IMAP", 443: "HTTPS", 465: "SMTPS", 587: "SMTP (Submission)",
@@ -29,78 +118,78 @@ COMMON_UDP_PORTS = {
     161: "SNMP", 162: "SNMP Trap", 500: "ISAKMP (IKE)", 514: "Syslog",
     1900: "SSDP", 4500: "IPsec NAT Traversal", 5353: "MDNS"
 }
-
-# List of known weak/insecure SSL/TLS protocols
 INSECURE_SSL_VERSIONS = {
-    "SSLv2": ssl.PROTOCOL_SSLv23, # Placeholder, actual SSLv2 often disabled at compile time
+    "SSLv2": ssl.PROTOCOL_SSLv23,
     "SSLv3": ssl.PROTOCOL_SSLv23,
     "TLSv1.0": ssl.PROTOCOL_TLSv1,
     "TLSv1.1": ssl.PROTOCOL_TLSv1_1,
 }
-
-# List of some known weak cipher suites (OpenSSL names)
 WEAK_CIPHERS = [
-    ("NULL", "Null encryption"),
-    ("EXPORT", "Export-grade ciphers"),
-    ("LOW", "Low-strength ciphers (less than 56-bit)"),
-    ("DES", "Single DES"),
-    ("3DES", "Triple DES (considered weak by modern standards)"),
-    ("RC4", "RC4 stream cipher"),
-    ("MD5", "Ciphers using MD5 for message authentication"),
-    ("SEED", "SEED block cipher (less common, potentially weaker)"),
-    ("IDEA", "IDEA block cipher"),
-    ("PSK", "Pre-Shared Key ciphers (if not intentionally used with strong keys)"),
-    ("ADH", "Anonymous Diffie-Hellman"),
-    ("AECDH", "Anonymous Elliptic Curve Diffie-Hellman"),
+    ("NULL", "Null encryption"), ("EXPORT", "Export-grade ciphers"),
+    ("LOW", "Low-strength ciphers (<56-bit)"), ("DES", "Single DES"),
+    ("3DES", "Triple DES (weak by modern standards)"), ("RC4", "RC4 stream cipher"),
+    ("MD5", "Ciphers using MD5 for auth"), ("SEED", "SEED block cipher"),
+    ("IDEA", "IDEA block cipher"), ("PSK", "Pre-Shared Key (if not strong)"),
+    ("ADH", "Anonymous Diffie-Hellman"), ("AECDH", "Anonymous ECDH"),
 ]
 
-
 # --- Helper Functions ---
+def rich_print(*args, **kwargs):
+    """Wrapper to use Rich console or fallback print."""
+    if use_rich_output: # Global flag based on RICH_AVAILABLE and --no-rich
+        console.print(*args, **kwargs)
+    else:
+        # Convert Rich objects to strings for fallback_console
+        processed_args = []
+        for arg in args:
+            if RICH_AVAILABLE: # Check again in case use_rich_output was false but Rich is there
+                if isinstance(arg, (Panel, Table, Text, Padding)): # Add other Rich types as needed
+                    # For Rich objects, we might want to capture their string representation
+                    # This is tricky as Rich objects are complex.
+                    # Simplest is to let the fallback Console handle its own PanelFallback etc.
+                    if isinstance(arg, Panel) and not isinstance(arg, PanelFallback):
+                         processed_args.append(PanelFallback(str(arg.renderable), title=str(arg.title) if arg.title else ""))
+                    elif isinstance(arg, Table) and not isinstance(arg, TableFallback):
+                        # This conversion is too complex for a simple fallback.
+                        # The fallback TableFallback should be used directly.
+                        processed_args.append(f"[Rich Table: {arg.title or 'Untitled'}]")
+                    elif isinstance(arg, Text):
+                        processed_args.append(arg.plain)
+                    else:
+                         processed_args.append(str(arg)) # Fallback for other Rich objects
+                    continue
+            processed_args.append(str(arg))
+        console_instance.print(*processed_args)
+
 
 def resolve_host(hostname):
-    """Resolves a hostname to an IP address."""
     try:
         ip_address = socket.gethostbyname(hostname)
         return ip_address
     except socket.gaierror:
-        print(f"Error: Could not resolve hostname '{hostname}'.")
+        rich_print(f"[bold red]Error:[/bold red] Could not resolve hostname '{escape(hostname)}'.")
         return None
 
 def parse_ports(port_string):
-    """Parses a port string (e.g., "80,443,8000-8100") into a list of integers."""
     ports = set()
-    if not port_string:
-        return []
+    if not port_string: return []
     parts = port_string.split(',')
     for part in parts:
         part = part.strip()
         if '-' in part:
             start_str, end_str = part.split('-', 1)
             try:
-                start = int(start_str)
-                end = int(end_str)
-                if start <= end:
-                    ports.update(range(start, end + 1))
-                else:
-                    print(f"Warning: Invalid port range '{part}' ignored (start > end).")
-            except ValueError:
-                print(f"Warning: Invalid port range value in '{part}' ignored.")
+                start, end = int(start_str), int(end_str)
+                if start <= end: ports.update(range(start, end + 1))
+                else: rich_print(f"[orange3]Warning:[/orange3] Invalid port range '{escape(part)}' ignored (start > end).")
+            except ValueError: rich_print(f"[orange3]Warning:[/orange3] Invalid port range value in '{escape(part)}' ignored.")
         else:
-            try:
-                ports.add(int(part))
-            except ValueError:
-                print(f"Warning: Invalid port value '{part}' ignored.")
+            try: ports.add(int(part))
+            except ValueError: rich_print(f"[orange3]Warning:[/orange3] Invalid port value '{escape(part)}' ignored.")
     return sorted(list(ports))
 
 # --- Scanning Functions ---
-
 def tcp_scan_port(target_ip, port, timeout):
-    """
-    Scans a single TCP port.
-    Returns: (status, banner)
-    status: "Open", "Closed", "Filtered" (or error string)
-    banner: Service banner if port is open, else None
-    """
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -109,763 +198,466 @@ def tcp_scan_port(target_ip, port, timeout):
         if result == 0:
             banner = None
             try:
-                if port == 80: # HTTP
-                    sock.sendall(b"HEAD / HTTP/1.1\r\nHost: " + target_ip.encode() + b"\r\nConnection: close\r\n\r\n")
-                elif port == 443: # HTTPS - banner grabbing handled by SSL check
-                    pass # Banner will be "N/A" here, SSL check will provide protocol details
-                elif port == 21: # FTP
-                    sock.settimeout(1.0) # FTP servers usually send banner immediately
-                # For other services, just try to receive immediately
+                if port == 80: sock.sendall(b"HEAD / HTTP/1.1\r\nHost: " + target_ip.encode() + b"\r\nConnection: close\r\n\r\n")
+                elif port == 443: pass
+                elif port == 21: sock.settimeout(1.0)
+                
                 if port != 443:
-                    # Short timeout for banner recv, as some services send it immediately
-                    # and others might wait for client input.
-                    current_timeout = sock.gettimeout()
-                    sock.settimeout(min(0.5, current_timeout)) # Don't exceed original timeout
+                    current_timeout = sock.gettimeout(); sock.settimeout(min(0.5, current_timeout))
                     banner_bytes = sock.recv(MAX_BANNER_SIZE)
                     banner = banner_bytes.decode(errors='ignore').strip()
-                    sock.settimeout(current_timeout) # Restore original timeout
-            except socket.timeout:
-                banner = "N/A (Timeout receiving banner)"
-            except Exception as e:
-                banner = f"N/A (Error receiving banner: {e})"
+                    sock.settimeout(current_timeout)
+            except socket.timeout: banner = "N/A (Timeout receiving banner)"
+            except Exception as e: banner = f"N/A (Error: {escape(str(e))[:30]})"
             return "Open", banner
-        else:
-            return "Closed", None
-    except socket.timeout:
-        return "Filtered (Timeout)", None
-    except socket.error as e:
-        return f"Error ({e.strerror})", None
+        else: return "Closed", None
+    except socket.timeout: return "Filtered (Timeout)", None
+    except socket.error as e: return f"Error ({escape(e.strerror)})", None
     finally:
-        if sock:
-            sock.close()
+        if sock: sock.close()
 
 def udp_scan_port(target_ip, port, timeout):
-    """
-    Scans a single UDP port. This is less reliable than TCP scanning.
-    Returns: status ("Open|Filtered", "Closed", or error string)
-    """
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
-        sock.sendto(b'', (target_ip, port)) # Send empty UDP packet
+        sock.sendto(b'', (target_ip, port))
         try:
-            # For some common UDP services, a specific probe might elicit a better response.
-            # Example: DNS query for port 53
-            # if port == 53:
-            #    sock.sendto(b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01', (target_ip, port))
-            
-            sock.recvfrom(1024) # buffer size
-            return "Open"
-        except socket.timeout:
-            return "Open|Filtered" # No response, could be open or filtered
-        except ConnectionRefusedError:
-            return "Closed" # ICMP Port Unreachable received
+            sock.recvfrom(1024); return "Open"
+        except socket.timeout: return "Open|Filtered"
+        except ConnectionRefusedError: return "Closed"
         except socket.error as e:
-            if hasattr(e, 'winerror') and e.winerror == 10054: # WSAECONNRESET (Windows)
-                return "Closed"
-            if hasattr(e, 'errno') and e.errno in [111, 104]: # Connection refused / reset (Linux)
-                 return "Closed"
-            return f"Error ({str(e)})"
-
-    except socket.error as e:
-        return f"Error creating socket ({str(e)})"
+            if hasattr(e, 'winerror') and e.winerror == 10054: return "Closed"
+            if hasattr(e, 'errno') and e.errno in [111, 104]: return "Closed"
+            return f"Error ({escape(str(e))})"
+    except socket.error as e: return f"Error creating socket ({escape(str(e))})"
     finally:
-        if sock:
-            sock.close()
+        if sock: sock.close()
 
 def get_service_name(port, protocol, banner=None):
-    """Guess service name based on port and protocol, refine with banner if available."""
     service_map = COMMON_TCP_PORTS if protocol.lower() == 'tcp' else COMMON_UDP_PORTS
     service = service_map.get(port, "Unknown")
-
-    if banner: # Try to refine based on banner content
+    if banner:
         banner_lower = banner.lower()
-        if any(kw in banner_lower for kw in ["http", "apache", "nginx", "iis", "server:"]):
-            service = "HTTP" if port != 443 and "https" not in banner_lower else "HTTPS"
+        if any(kw in banner_lower for kw in ["http", "apache", "nginx", "iis", "server:"]): service = "HTTP" if port != 443 and "https" not in banner_lower else "HTTPS"
         elif "ftp" in banner_lower: service = "FTP"
         elif "ssh" in banner_lower: service = "SSH"
         elif "smtp" in banner_lower: service = "SMTP"
-        elif "pop3" in banner_lower: service = "POP3"
-        elif "imap" in banner_lower: service = "IMAP"
-        elif "telnet" in banner_lower: service = "Telnet"
-        # Add more banner checks as needed
     return service
 
-
 def check_ssl_tls(hostname, port, results_dict):
-    """
-    Performs SSL/TLS checks on a given host and port.
-    Updates results_dict with SSL/TLS information.
-    """
-    # Use a specific timeout for SSL/TLS checks, can be longer than general TCP connect
-    ssl_timeout = max(DEFAULT_TCP_TIMEOUT, 2.0) # Ensure at least 2s for SSL handshake
-
-    ssl_info = {
-        "enabled": False,
-        "certificate": None,
-        "insecure_protocols_supported": [],
-        "weak_ciphers_supported_by_server": [], # Ciphers server might support (advanced)
-        "negotiated_cipher_details": None,
-        "negotiated_cipher_is_weak": False,
-        "error": None
-    }
-
-    # Standard connection to get cert and negotiated cipher
+    ssl_timeout = max(DEFAULT_TCP_TIMEOUT, 2.0)
+    ssl_info = {"enabled": False, "certificate": None, "insecure_protocols_supported": [],
+                "weak_ciphers_supported_by_server": [], "negotiated_cipher_details": None,
+                "negotiated_cipher_is_weak": False, "error": None}
     try:
-        context = ssl.create_default_context()
-        # Allow connection even if cert is self-signed for info gathering
-        context.check_hostname = False 
-        context.verify_mode = ssl.CERT_NONE 
-
+        context = ssl.create_default_context(); context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
         with socket.create_connection((hostname, port), timeout=ssl_timeout) as sock:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                ssl_info["enabled"] = True
-                cert = ssock.getpeercert()
+                ssl_info["enabled"] = True; cert = ssock.getpeercert()
                 if cert:
-                    ssl_info["certificate"] = {
-                        "subject": dict(x[0] for x in cert.get("subject", [])),
-                        "issuer": dict(x[0] for x in cert.get("issuer", [])),
-                        "version": cert.get("version"),
-                        "serialNumber": cert.get("serialNumber"),
-                        "notBefore": cert.get("notBefore"),
-                        "notAfter": cert.get("notAfter"),
-                    }
+                    ssl_info["certificate"] = {k: (dict(x[0] for x in cert[k]) if k in ["subject", "issuer"] else cert[k]) for k in ["subject", "issuer", "version", "serialNumber", "notBefore", "notAfter"]}
                     try:
-                        # Ensure Z is appended if missing for UTC, strptime can be picky
                         not_after_str = cert["notAfter"]
-                        if not not_after_str.endswith("Z"): # some certs might not have Z
-                             if " GMT" in not_after_str: # Handle "GMT"
-                                 not_after_str = not_after_str.replace(" GMT","Z")
-                             # else assume UTC if no timezone info and no Z
-                        
-                        # Try multiple formats for date parsing
+                        if not not_after_str.endswith("Z"): not_after_str = not_after_str.replace(" GMT","Z") if " GMT" in not_after_str else not_after_str
                         parsed_date = None
                         for fmt in ("%b %d %H:%M:%S %Y %Z", "%Y%m%d%H%M%SZ", "%Y%m%d%H%M%S%z"):
                             try:
                                 parsed_date = datetime.strptime(not_after_str, fmt)
-                                if parsed_date.tzinfo is None: # If naive, assume UTC
-                                     parsed_date = parsed_date.replace(tzinfo=datetime.timezone.utc)
+                                if parsed_date.tzinfo is None: parsed_date = parsed_date.replace(tzinfo=datetime.timezone.utc)
                                 break
-                            except ValueError:
-                                continue
-                        
-                        if parsed_date:
-                            if parsed_date < datetime.now(datetime.timezone.utc):
-                                ssl_info["certificate"]["expired"] = True
-                            else:
-                                ssl_info["certificate"]["expired"] = False
-                        else:
-                             ssl_info["certificate"]["expired"] = "Error parsing date"
-
-                    except Exception as e_date:
-                        ssl_info["certificate"]["expired"] = f"Error parsing date ({e_date})"
+                            except ValueError: continue
+                        ssl_info["certificate"]["expired"] = parsed_date < datetime.now(datetime.timezone.utc) if parsed_date else "Error parsing date"
+                    except Exception as e_date: ssl_info["certificate"]["expired"] = f"Error parsing date ({escape(str(e_date))})"
                 
-                negotiated_cipher = ssock.cipher()
-                if negotiated_cipher:
-                    ssl_info["negotiated_cipher_details"] = {
-                        "name": negotiated_cipher[0],
-                        "protocol_version": negotiated_cipher[1],
-                        "secret_bits": negotiated_cipher[2]
-                    }
-                    for weak_pattern, desc in WEAK_CIPHERS:
-                        if weak_pattern.lower() in negotiated_cipher[0].lower():
+                nc = ssock.cipher()
+                if nc:
+                    ssl_info["negotiated_cipher_details"] = {"name": nc[0], "protocol_version": nc[1], "secret_bits": nc[2]}
+                    for pattern, desc in WEAK_CIPHERS:
+                        if pattern.lower() in nc[0].lower():
                             ssl_info["negotiated_cipher_is_weak"] = True
-                            ssl_info["weak_ciphers_supported_by_server"].append(f"{negotiated_cipher[0]} (Negotiated - {desc})") # Mark as negotiated
+                            ssl_info["weak_ciphers_supported_by_server"].append(f"{nc[0]} (Negotiated - {escape(desc)})")
                             break
-    except ssl.SSLError as e:
-        ssl_info["error"] = f"SSL Error: {e}"
-    except socket.timeout:
-        ssl_info["error"] = "Timeout during SSL/TLS handshake."
-    except ConnectionRefusedError:
-        ssl_info["error"] = "Connection refused for SSL/TLS."
-    except Exception as e:
-        ssl_info["error"] = f"Generic error during SSL/TLS setup: {e}"
+    except ssl.SSLError as e: ssl_info["error"] = f"SSL Error: {escape(str(e))}"
+    except socket.timeout: ssl_info["error"] = "Timeout during SSL/TLS handshake."
+    except ConnectionRefusedError: ssl_info["error"] = "Connection refused for SSL/TLS."
+    except Exception as e: ssl_info["error"] = f"Generic SSL setup error: {escape(str(e))}"
 
-    if not ssl_info["enabled"] and ssl_info["error"]: # If initial connection failed, don't try protocols
-        results_dict["ssl_tls"] = ssl_info
-        return
+    if not ssl_info["enabled"] and ssl_info["error"]: results_dict["ssl_tls"] = ssl_info; return
 
-    # Test for insecure protocols
-    for proto_name, proto_val_or_const in INSECURE_SSL_VERSIONS.items():
-        # For PROTOCOL_SSLv23, we need to set options to limit to SSLv2 or SSLv3
-        # For specific versions like PROTOCOL_TLSv1, it's more direct.
+    for proto_name, proto_val in INSECURE_SSL_VERSIONS.items():
         test_context = None
         try:
-            if proto_name == "SSLv2": # SSLv2 is tricky, often disabled. PROTOCOL_SSLv2 is usually not available.
-                                     # Try to force via options on SSLv23 if possible.
-                test_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-                test_context.options |= ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2 | ssl.OP_NO_TLSv1_3
-            elif proto_name == "SSLv3":
-                test_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23) # Start with broader context
-                test_context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2 | ssl.OP_NO_TLSv1_3
-                # Or try specific if available:
-                # test_context = ssl.SSLContext(ssl.PROTOCOL_SSLv3) # This might fail if SSLv3 support is compiled out
-            else: # For TLSv1.0, TLSv1.1
-                 test_context = ssl.SSLContext(proto_val_or_const)
-
+            if proto_name == "SSLv2": test_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23); test_context.options |= ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2 | ssl.OP_NO_TLSv1_3
+            elif proto_name == "SSLv3": test_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23); test_context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2 | ssl.OP_NO_TLSv1_3
+            else: test_context = ssl.SSLContext(proto_val)
             if not test_context: continue
-
-            test_context.check_hostname = False
-            test_context.verify_mode = ssl.CERT_NONE
-            # Optionally, try to set only very basic ciphers to increase chance of protocol acceptance if ciphers are an issue
-            # test_context.set_ciphers('DEFAULT') # or even 'ALL:@SECLEVEL=0' if desperate, but be careful
-
-            with socket.create_connection((hostname, port), timeout=ssl_timeout) as test_sock:
-                with test_context.wrap_socket(test_sock, server_hostname=hostname) as test_ssock:
-                    # If connection succeeds, the server supports this protocol
-                    ssl_info["insecure_protocols_supported"].append(f"{proto_name} (Server accepted: {test_ssock.version()})")
-        except (ssl.SSLError, socket.timeout, ConnectionRefusedError, ValueError) as e_proto:
-            # ValueError can happen if protocol constant is bad or options are conflicting
-            # print(f"Note: Could not test {proto_name} for {hostname}:{port} - {type(e_proto).__name__}: {e_proto}")
-            pass # Expected if server doesn't support it, or other SSL issue like no common ciphers
-        except Exception as e_generic_proto:
-            # print(f"Note: Generic error testing {proto_name} for {hostname}:{port} - {e_generic_proto}")
-            pass
-
+            test_context.check_hostname = False; test_context.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((hostname, port), timeout=ssl_timeout) as tsock:
+                with test_context.wrap_socket(tsock, server_hostname=hostname) as tssock:
+                    ssl_info["insecure_protocols_supported"].append(f"{proto_name} (Server accepted: {tssock.version()})")
+        except (ssl.SSLError, socket.timeout, ConnectionRefusedError, ValueError): pass
+        except Exception: pass
     results_dict["ssl_tls"] = ssl_info
 
-
 def get_os_guess_ttl(target_ip):
-    """
-    Guesses OS based on TTL value from a ping response.
-    This is a heuristic and can be unreliable.
-    Returns: OS guess string or "Unknown"
-    """
     try:
-        # Determine ping parameters based on OS
-        system = platform.system().lower()
-        if system == 'windows':
-            command = ['ping', '-n', '1', '-w', '1000', target_ip] # 1 packet, 1000ms timeout
-        elif system == 'linux':
-            command = ['ping', '-c', '1', '-W', '1', target_ip]    # 1 packet, 1s timeout
-        elif system == 'darwin': # macOS
-            command = ['ping', '-c', '1', '-t', '1', target_ip]    # 1 packet, 1s timeout
-        else: # Other OS (e.g. BSD) might use -c and -t or -W. Defaulting to Linux-like.
-            command = ['ping', '-c', '1', '-W', '1', target_ip]
-
+        sys_platform = platform.system().lower()
+        if sys_platform == 'windows': command = ['ping', '-n', '1', '-w', '1000', target_ip]
+        elif sys_platform == 'linux': command = ['ping', '-c', '1', '-W', '1', target_ip]
+        elif sys_platform == 'darwin': command = ['ping', '-c', '1', '-t', '1', target_ip]
+        else: command = ['ping', '-c', '1', '-W', '1', target_ip]
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate(timeout=2.5) # Process timeout slightly longer than ping timeout
-        
+        stdout, stderr = proc.communicate(timeout=2.5)
         output = stdout.decode(errors='ignore').lower()
-        
         ttl_match = re.search(r"ttl=(\d+)", output)
         if ttl_match:
             ttl = int(ttl_match.group(1))
-            # Common TTL starting points (these can vary due to hops)
             if ttl > 128 and ttl <= 255 : return f"Solaris/AIX/Cisco (TTL: {ttl}, Original ~255)"
             elif ttl > 64 and ttl <= 128: return f"Windows (TTL: {ttl}, Original ~128)"
             elif ttl > 32 and ttl <= 64 : return f"Linux/Unix (TTL: {ttl}, Original ~64)"
-            elif ttl <= 32             : return f"Linux/Unix (TTL: {ttl}, Original ~32 or many hops)"
-            else: return f"Unknown (TTL: {ttl})"
-        else:
-            # Fallback for different ping output formats if regex fails
-            if "ttl=" in output:
-                return "OS (TTL found, specific value parsing failed)"
-            if proc.returncode == 0: # Ping succeeded but no TTL? Unlikely but possible.
-                return "Unknown (Ping success, but no TTL in output)"
-            else: # Ping failed
-                error_output = stderr.decode(errors='ignore').lower().strip()
-                if "host unreachable" in error_output: return "Unknown (Host Unreachable)"
-                if "request timed out" in output: return "Unknown (Ping Request Timed Out)" # Some pings output timeout to stdout
-                return f"Unknown (Ping failed: {error_output[:50]})"
-
-
-    except subprocess.TimeoutExpired:
-        return "Unknown (Ping command timed out)"
-    except FileNotFoundError:
-        return "Unknown (Ping command not found. Is it in PATH?)"
-    except Exception as e:
-        return f"Unknown (Ping error: {str(e)[:50]})"
-
+            else: return f"Linux/Unix (TTL: {ttl}, Original <=32 or many hops)"
+        error_output = stderr.decode(errors='ignore').lower().strip()
+        if "host unreachable" in error_output: return "Unknown (Host Unreachable)"
+        if "request timed out" in output or "timed out" in error_output : return "Unknown (Ping Request Timed Out)"
+        return f"Unknown (Ping failed: {escape(error_output[:40])})"
+    except subprocess.TimeoutExpired: return "Unknown (Ping command timed out)"
+    except FileNotFoundError: return "Unknown (Ping command not found)"
+    except Exception as e: return f"Unknown (Ping error: {escape(str(e)[:40])})"
 
 # --- Reporting Functions ---
-
 def generate_json_report(data, filename):
-    """Generates a JSON report."""
     try:
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=4, default=str) # default=str for datetime
-        print(f"JSON report saved to {filename}")
-    except IOError as e:
-        print(f"Error saving JSON report to {filename}: {e}")
+        with open(filename, 'w') as f: json.dump(data, f, indent=4, default=str)
+        rich_print(f"[green]JSON report saved to[/green] [cyan]{escape(filename)}[/cyan]")
+    except IOError as e: rich_print(f"[red]Error saving JSON report to {escape(filename)}:[/red] {escape(str(e))}")
 
 def generate_csv_report(data, filename):
-    """Generates a CSV report."""
-    if not data.get("ports"):
-        print("No port data to generate CSV report.")
-        return
-    
+    if not data.get("ports"): rich_print("[yellow]No port data to generate CSV report.[/yellow]"); return
     try:
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
-            # Define header, including SSL fields conditionally
             header = ["Host", "Port", "Protocol", "Status", "Service", "Banner"]
-            # Check if any port has SSL info to decide if SSL columns are needed
-            has_ssl_info = any("ssl_tls" in port_info for port_info in data["ports"].values() if isinstance(port_info, dict))
-
-            if has_ssl_info:
-                header.extend([
-                    "SSL Enabled", "SSL Error", 
-                    "Cert Subject CN", "Cert Issuer CN", "Cert Expired", "Cert NotAfter", 
-                    "Insecure Protocols Supported", "Negotiated Cipher", "Negotiated Cipher Weak"
-                ])
+            has_ssl = any("ssl_tls" in pi for pi in data["ports"].values() if isinstance(pi, dict))
+            if has_ssl: header.extend(["SSL Enabled", "SSL Error", "Cert Subject CN", "Cert Issuer CN", "Cert Expired", "Cert NotAfter", "Insecure Protocols", "Negotiated Cipher", "Negotiated Cipher Weak"])
             writer.writerow(header)
-
-            for port_num_key, port_info in data["ports"].items():
-                if not isinstance(port_info, dict): continue # Skip if port_info is not a dict (e.g. malformed)
-
-                # Handle combined keys like "80/TCP" or just port numbers
-                port_num_str = str(port_num_key)
-                if "/" in port_num_str:
-                    port_val = port_num_str.split("/")[0]
-                else:
-                    port_val = port_num_str
-
-                row = [
-                    data.get("target_host", "N/A"), port_val, port_info.get("protocol", "N/A"),
-                    port_info.get("status", "N/A"), port_info.get("service", "N/A"),
-                    port_info.get("banner", "N/A")
-                ]
-                if has_ssl_info:
-                    if "ssl_tls" in port_info:
-                        ssl_data = port_info["ssl_tls"]
-                        cert_info = ssl_data.get("certificate", {})
-                        negotiated_cipher = ssl_data.get("negotiated_cipher_details", {})
-                        row.extend([
-                            ssl_data.get("enabled", False),
-                            ssl_data.get("error", "N/A"),
-                            cert_info.get("subject", {}).get("commonName", "N/A"),
-                            cert_info.get("issuer", {}).get("commonName", "N/A"),
-                            cert_info.get("expired", "N/A"),
-                            cert_info.get("notAfter", "N/A"),
-                            ", ".join(ssl_data.get("insecure_protocols_supported", [])),
-                            negotiated_cipher.get("name", "N/A"),
-                            ssl_data.get("negotiated_cipher_is_weak", False)
-                        ])
-                    else:
-                        row.extend(["N/A"] * 9) # Pad with N/A for SSL columns
+            for pk, pi in data["ports"].items():
+                if not isinstance(pi, dict): continue
+                pv = str(pk).split("/")[0] if "/" in str(pk) else str(pk)
+                row = [data.get("target_host", "N/A"), pv, pi.get("protocol", "N/A"), pi.get("status", "N/A"), pi.get("service", "N/A"), pi.get("banner", "N/A")]
+                if has_ssl:
+                    if "ssl_tls" in pi:
+                        sd, ci, nc = pi["ssl_tls"], sd.get("certificate",{}), sd.get("negotiated_cipher_details",{})
+                        row.extend([sd.get("enabled", False), sd.get("error", "N/A"), ci.get("subject",{}).get("commonName","N/A"), ci.get("issuer",{}).get("commonName","N/A"), ci.get("expired","N/A"), ci.get("notAfter","N/A"), ", ".join(sd.get("insecure_protocols_supported",[])), nc.get("name","N/A"), sd.get("negotiated_cipher_is_weak",False)])
+                    else: row.extend(["N/A"] * 9)
                 writer.writerow(row)
-        print(f"CSV report saved to {filename}")
-    except IOError as e:
-        print(f"Error saving CSV report to {filename}: {e}")
-    except Exception as e_csv:
-        print(f"An unexpected error occurred during CSV generation: {e_csv}")
-
+        rich_print(f"[green]CSV report saved to[/green] [cyan]{escape(filename)}[/cyan]")
+    except IOError as e: rich_print(f"[red]Error saving CSV report to {escape(filename)}:[/red] {escape(str(e))}")
+    except Exception as e_csv: rich_print(f"[red]Unexpected CSV error:[/red] {escape(str(e_csv))}")
 
 def generate_html_report(data, filename):
-    """Generates an HTML report."""
-    # Basic HTML structure and styling
-    html_content = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>SocketSniper Scan Report: {data.get('target_host', 'N/A')}</title>
-        <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background-color: #f0f2f5; color: #333; font-size: 14px; }}
-            .container {{ max-width: 1200px; margin: 20px auto; padding: 20px; background-color: #fff; box-shadow: 0 0 15px rgba(0,0,0,0.1); border-radius: 8px; }}
-            h1, h2 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-            h1 {{ font-size: 24px; }}
-            h2 {{ font-size: 20px; margin-top: 25px; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-            th, td {{ border: 1px solid #ddd; padding: 10px 12px; text-align: left; vertical-align: top; }}
-            th {{ background-color: #3498db; color: white; font-weight: 600; }}
-            tr:nth-child(even) {{ background-color: #f9f9f9; }}
-            .status-open {{ color: #27ae60; font-weight: bold; }}
-            .status-closed {{ color: #c0392b; }}
-            .status-filtered, .status-openfiltered {{ color: #f39c12; }}
-            .status-error {{ color: #e74c3c; font-weight: bold; }}
-            .ssl-details {{ margin-top: 8px; padding-left: 15px; border-left: 3px solid #bdc3c7; font-size: 0.95em; }}
-            .ssl-details p {{ margin: 4px 0; }}
-            .ssl-details strong {{ color: #555; }}
-            .banner-pre {{ background-color: #ecf0f1; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; font-family: 'Courier New', Courier, monospace; font-size: 0.9em; max-height: 150px; overflow-y: auto; }}
-            .warning {{ color: #e67e22; font-weight: bold; }}
-            .summary-item {{ margin-bottom: 8px; }}
-            .summary-item strong {{ color: #34495e; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>SocketSniper Scan Report</h1>
-            <div class="summary-item"><strong>Target Host:</strong> {data.get('target_host', 'N/A')}</div>
-            <div class="summary-item"><strong>Resolved IP:</strong> {data.get('resolved_ip', 'N/A')}</div>
-            <div class="summary-item"><strong>Scan Timestamp:</strong> {data.get('scan_timestamp', 'N/A')}</div>
-            
-            <h2>OS Guess (via Ping TTL)</h2>
-            <p>{data.get('os_guess', 'Not performed or failed')}</p>
-
-            <h2>Port Scan Results</h2>
-    """
-
-    if not data.get("ports") or not any(isinstance(p_info, dict) for p_info in data["ports"].values()):
-        html_content += "<p>No port data available or no ports were successfully scanned.</p>"
+    # HTML generation remains largely the same, as it's self-contained markup
+    html_content = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SocketSniper Report: {escape(data.get('target_host', 'N/A'))}</title><style>body{{font-family: 'Segoe UI',sans-serif;margin:0;padding:0;background-color:#f0f2f5;color:#333;font-size:14px}}.container{{max-width:1200px;margin:20px auto;padding:20px;background-color:#fff;box-shadow:0 0 15px rgba(0,0,0,0.1);border-radius:8px}}h1,h2{{color:#2c3e50;border-bottom:2px solid #3498db;padding-bottom:10px}}h1{{font-size:24px}}h2{{font-size:20px;margin-top:25px}}table{{width:100%;border-collapse:collapse;margin-top:15px}}th,td{{border:1px solid #ddd;padding:10px 12px;text-align:left;vertical-align:top}}th{{background-color:#3498db;color:white;font-weight:600}}tr:nth-child(even){{background-color:#f9f9f9}}.status-open{{color:#27ae60;font-weight:bold}}.status-closed{{color:#c0392b}}.status-filtered,.status-openfiltered{{color:#f39c12}}.status-error{{color:#e74c3c;font-weight:bold}}.ssl-details{{margin-top:8px;padding-left:15px;border-left:3px solid #bdc3c7;font-size:0.95em}}.ssl-details p{{margin:4px 0}}.ssl-details strong{{color:#555}}.banner-pre{{background-color:#ecf0f1;padding:8px;border-radius:4px;white-space:pre-wrap;word-wrap:break-word;font-family:'Courier New',monospace;font-size:0.9em;max-height:150px;overflow-y:auto}}.warning{{color:#e67e22;font-weight:bold}}.summary-item{{margin-bottom:8px}}.summary-item strong{{color:#34495e}}</style></head><body><div class="container">
+    <h1>SocketSniper Scan Report</h1><div class="summary-item"><strong>Target Host:</strong> {escape(data.get('target_host', 'N/A'))}</div><div class="summary-item"><strong>Resolved IP:</strong> {escape(data.get('resolved_ip', 'N/A'))}</div><div class="summary-item"><strong>Scan Timestamp:</strong> {escape(data.get('scan_timestamp', 'N/A'))}</div>
+    <h2>OS Guess (via Ping TTL)</h2><p>{escape(data.get('os_guess', 'Not performed or failed'))}</p><h2>Port Scan Results</h2>"""
+    if not data.get("ports") or not any(isinstance(p_info, dict) for p_info in data["ports"].values()): html_content += "<p>No port data available.</p>"
     else:
-        html_content += """
-            <table>
-                <thead>
-                    <tr>
-                        <th>Port</th>
-                        <th>Protocol</th>
-                        <th>Status</th>
-                        <th>Service</th>
-                        <th>Banner</th>
-                        <th>SSL/TLS Information</th>
-                    </tr>
-                </thead>
-                <tbody>
-        """
-        # Sort ports: numeric first, then string keys (like "80/UDP")
+        html_content += """<table><thead><tr><th>Port</th><th>Protocol</th><th>Status</th><th>Service</th><th>Banner</th><th>SSL/TLS Info</th></tr></thead><tbody>"""
         sorted_ports = sorted(data["ports"].items(), key=lambda item: (isinstance(item[0], int), item[0]))
-
         for port_key, info in sorted_ports:
-            if not isinstance(info, dict): continue # Ensure info is a dictionary
-
-            status_class = "status-" + info.get('status', 'unknown').lower().replace("|", "").replace(" (timeout)", "filtered").replace(" (error)", "error")
-            
-            port_display = str(port_key) # Default display for port key
-
-            html_content += f"""
-                <tr>
-                    <td>{port_display}</td>
-                    <td>{info.get('protocol', 'N/A')}</td>
-                    <td class="{status_class}">{info.get('status', 'N/A')}</td>
-                    <td>{info.get('service', 'N/A')}</td>
-                    <td><pre class="banner-pre">{info.get('banner', 'N/A')}</pre></td>
-                    <td>
-            """
+            if not isinstance(info, dict): continue
+            status_class = "status-" + info.get('status','unknown').lower().replace("|","").replace(" (timeout)","filtered").replace(" (error)","error")
+            html_content += f"""<tr><td>{escape(str(port_key))}</td><td>{escape(info.get('protocol','N/A'))}</td><td class="{status_class}">{escape(info.get('status','N/A'))}</td><td>{escape(info.get('service','N/A'))}</td><td><pre class="banner-pre">{escape(info.get('banner','N/A'))}</pre></td><td>"""
             if "ssl_tls" in info:
-                ssl_data = info["ssl_tls"]
-                if isinstance(ssl_data, dict): # Ensure ssl_data is a dictionary
-                    html_content += "<div class='ssl-details'>"
+                ssl_data = info["ssl_tls"]; html_content += "<div class='ssl-details'>"
+                if isinstance(ssl_data, dict):
                     if ssl_data.get("enabled"):
-                        html_content += f"<p><strong>SSL/TLS Enabled:</strong> Yes</p>"
-                        if ssl_data.get("negotiated_cipher_details"):
-                            nc = ssl_data["negotiated_cipher_details"]
-                            html_content += f"<p><strong>Negotiated:</strong> {nc.get('name','N/A')} ({nc.get('protocol_version','N/A')})</p>"
-                            if ssl_data.get("negotiated_cipher_is_weak"):
-                                html_content += f"<p class='warning'><strong>Warning: Negotiated cipher is potentially weak.</strong></p>"
-                        
-                        if ssl_data.get("certificate"):
-                            cert = ssl_data["certificate"]
-                            if isinstance(cert, dict): # Ensure cert is a dictionary
-                                html_content += f"<p><strong>Cert Subject:</strong> {cert.get('subject', {}).get('commonName', 'N/A')}</p>"
-                                html_content += f"<p><strong>Cert Issuer:</strong> {cert.get('issuer', {}).get('commonName', 'N/A')}</p>"
-                                html_content += f"<p><strong>Cert Valid:</strong> Not Before: {cert.get('notBefore', 'N/A')}, Not After: {cert.get('notAfter', 'N/A')}</p>"
-                                if cert.get('expired') is True:
-                                    html_content += f"<p class='warning'><strong>Cert Expired: Yes</strong></p>"
-                                elif cert.get('expired') is False:
-                                    html_content += f"<p><strong>Cert Expired:</strong> No</p>"
-                                else:
-                                     html_content += f"<p><strong>Cert Expired:</strong> {cert.get('expired', 'N/A')}</p>"
-
-                        insec_protos = ssl_data.get("insecure_protocols_supported", [])
-                        if insec_protos:
-                            html_content += f"<p class='warning'><strong>Insecure Protocols Supported:</strong> {', '.join(insec_protos)}</p>"
-                        else:
-                            html_content += f"<p><strong>Insecure Protocols Supported:</strong> None detected</p>"
-                        
-                        weak_ciphers_list = ssl_data.get("weak_ciphers_supported_by_server", [])
-                        if weak_ciphers_list:
-                             html_content += f"<p class='warning'><strong>Potentially Weak Ciphers (Server List/Negotiated):</strong> {', '.join(weak_ciphers_list)}</p>"
-
-                        if ssl_data.get("error"):
-                             html_content += f"<p><strong>SSL Note/Error:</strong> {ssl_data['error']}</p>"
-                    elif ssl_data.get("error"):
-                         html_content += f"<p>SSL/TLS Check Error: {ssl_data['error']}</p>"
-                    else:
-                        html_content += "N/A (Not an SSL/TLS service or check inconclusive)"
-                    html_content += "</div>"
-                else:
-                    html_content += "SSL data format error."
-            else:
-                html_content += "N/A"
-            html_content += "</td></tr>"
-        html_content += "</tbody></table>"
-
-    html_content += """
-        </div>
-    </body>
-    </html>
-    """
+                        html_content+=f"<p><strong>SSL/TLS Enabled:</strong> Yes</p>"
+                        if ssl_data.get("negotiated_cipher_details"): nc=ssl_data["negotiated_cipher_details"]; html_content+=f"<p><strong>Negotiated:</strong> {escape(nc.get('name','N/A'))} ({escape(nc.get('protocol_version','N/A'))})</p>"; html_content+=f"<p class='warning'><strong>Warning: Negotiated cipher potentially weak.</strong></p>" if ssl_data.get("negotiated_cipher_is_weak") else ""
+                        if ssl_data.get("certificate"): cert=ssl_data["certificate"]; html_content+=f"<p><strong>Cert Subject:</strong> {escape(cert.get('subject',{}).get('commonName','N/A'))}</p><p><strong>Cert Issuer:</strong> {escape(cert.get('issuer',{}).get('commonName','N/A'))}</p><p><strong>Cert Valid:</strong> Not Before: {escape(cert.get('notBefore','N/A'))}, Not After: {escape(cert.get('notAfter','N/A'))}</p>"; html_content+=f"<p class='warning'><strong>Cert Expired: Yes</strong></p>" if cert.get('expired') is True else (f"<p><strong>Cert Expired:</strong> No</p>" if cert.get('expired') is False else f"<p><strong>Cert Expired:</strong> {escape(str(cert.get('expired','N/A')))}</p>")
+                        insec_p = ssl_data.get("insecure_protocols_supported",[]); html_content+=f"<p class='warning'><strong>Insecure Protocols:</strong> {escape(', '.join(insec_p))}</p>" if insec_p else f"<p><strong>Insecure Protocols:</strong> None detected</p>"
+                        weak_c = ssl_data.get("weak_ciphers_supported_by_server",[]); html_content+=f"<p class='warning'><strong>Potentially Weak Ciphers:</strong> {escape(', '.join(weak_c))}</p>" if weak_c else ""
+                        if ssl_data.get("error"): html_content+=f"<p><strong>SSL Note/Error:</strong> {escape(ssl_data['error'])}</p>"
+                    elif ssl_data.get("error"): html_content+=f"<p>SSL/TLS Check Error: {escape(ssl_data['error'])}</p>"
+                    else: html_content+="N/A (Not SSL/TLS or check inconclusive)"
+                else: html_content+="SSL data format error."
+                html_content+="</div>"
+            else: html_content+="N/A"
+            html_content+="</td></tr>"
+        html_content+="</tbody></table>"
+    html_content+="</div></body></html>"
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-        print(f"HTML report saved to {filename}")
-    except IOError as e:
-        print(f"Error saving HTML report to {filename}: {e}")
-
+        with open(filename, 'w', encoding='utf-8') as f: f.write(html_content)
+        rich_print(f"[green]HTML report saved to[/green] [cyan]{escape(filename)}[/cyan]")
+    except IOError as e: rich_print(f"[red]Error saving HTML report to {escape(filename)}:[/red] {escape(str(e))}")
 
 # --- Main ---
-def main():
-    # Setup Rich Console
-    console = Console()
+# Global flag to control Rich output, can be overridden by --no-rich
+use_rich_output = RICH_AVAILABLE
 
-    # ASCII Art Banner for SocketSniper (Red)
-    banner = r"""
+def main():
+    global use_rich_output # Allow main to modify this based on args
+
+    parser = argparse.ArgumentParser(
+        description="SocketSniper - Deep Port Scanner & Fingerprinter. Use responsibly.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("target", help="Target hostname or IP address.")
+    parser.add_argument("-p", "--ports", help="Ports/ranges for TCP & UDP (e.g., '21-23,80,443').", default=None)
+    parser.add_argument("-t", "--tcp-ports", help="Specific TCP ports/ranges.")
+    parser.add_argument("-u", "--udp-ports", help="Specific UDP ports/ranges.")
+    parser.add_argument("--tcp-timeout", type=float, default=DEFAULT_TCP_TIMEOUT, help=f"TCP timeout (sec, default: {DEFAULT_TCP_TIMEOUT}).")
+    parser.add_argument("--udp-timeout", type=float, default=DEFAULT_UDP_TIMEOUT, help=f"UDP timeout (sec, default: {DEFAULT_UDP_TIMEOUT}).")
+    parser.add_argument("--no-os-detect", action="store_true", help="Disable OS detection.")
+    parser.add_argument("--no-ssl-check", action="store_true", help="Disable SSL/TLS checks.")
+    parser.add_argument("--json", metavar="FILE", help="Export to JSON file.")
+    parser.add_argument("--csv", metavar="FILE", help="Export to CSV file.")
+    parser.add_argument("--html", metavar="FILE", help="Export to HTML file.")
+    parser.add_argument("--threads", type=int, default=10, help="TCP scan threads (default: 10, max: 50).")
+    parser.add_argument("--no-rich", action="store_true", help="Disable Rich CLI output (uses plain text).")
+
+    args = parser.parse_args()
+
+    if args.no_rich:
+        use_rich_output = False
+        # Re-initialize console if --no-rich is used and Rich was available
+        if RICH_AVAILABLE: # Check if Rich was initially available
+            global console
+            console = ConsoleFallback()
+
+
+    # ASCII Art Banner for SocketSniper - now with Rich styling
+    banner_text = r"""
     ███████╗ ██████╗  ██████╗██╗  ██╗███████╗████████╗███████╗███╗   ██╗██╗██████╗ ███████╗██████╗ 
     ██╔════╝██╔═══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝██╔════╝████╗  ██║██║██╔══██╗██╔════╝██╔══██╗
     ███████╗██║   ██║██║     █████╔╝ █████╗     ██║   ███████╗██╔██╗ ██║██║██████╔╝█████╗  ██████╔╝
     ╚════██║██║   ██║██║     ██╔═██╗ ██╔══╝     ██║   ╚════██║██║╚██╗██║██║██╔═══╝ ██╔══╝  ██╔══██╗
     ███████║╚██████╔╝╚██████╗██║  ██╗███████╗   ██║   ███████║██║ ╚████║██║██║     ███████╗██║  ██║
     ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═══╝╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝
-                        Deep Port Scanner & Fingerprinter
-                    Use responsibly and only on systems you have explicit permission to scan.
-                    Developed by: 0verWatchO5
+                    Deep Port Scanner & Fingerprinter
+                    [italic]Version 1.0.0 - 2025[/italic]
+                    Developed by [bold]0verWatchO5[/bold]
     """
-    console.print(Text(banner, style="bold red"))
-
-    parser = argparse.ArgumentParser(
-        description="SocketSniper - Deep Port Scanner & Fingerprinter. Use responsibly and only on systems you have explicit permission to scan.",
-        formatter_class=argparse.RawTextHelpFormatter # To keep banner formatting in help
-    )
-    parser.add_argument("target", help="Target hostname or IP address.")
-    parser.add_argument("-p", "--ports", help="Comma-separated ports/ranges to scan for both TCP and UDP (e.g., '21-23,80,443,1000-1005'). Overrides common ports.", default=None)
-    parser.add_argument("-t", "--tcp-ports", help="Specific TCP ports/ranges to scan (e.g., '22,80,443'). Appends to -p if both used.")
-    parser.add_argument("-u", "--udp-ports", help="Specific UDP ports/ranges to scan (e.g., '53,161'). Appends to -p if both used.")
-    parser.add_argument("--tcp-timeout", type=float, default=DEFAULT_TCP_TIMEOUT, help=f"Timeout for TCP connections in seconds (default: {DEFAULT_TCP_TIMEOUT}).")
-    parser.add_argument("--udp-timeout", type=float, default=DEFAULT_UDP_TIMEOUT, help=f"Timeout for UDP probes in seconds (default: {DEFAULT_UDP_TIMEOUT}).")
-    parser.add_argument("--no-os-detect", action="store_true", help="Disable OS detection via ping.")
-    parser.add_argument("--no-ssl-check", action="store_true", help="Disable SSL/TLS checks for identified services.")
-    parser.add_argument("--json", metavar="FILE", help="Export results to JSON file.")
-    parser.add_argument("--csv", metavar="FILE", help="Export results to CSV file.")
-    parser.add_argument("--html", metavar="FILE", help="Export results to HTML file.")
-    parser.add_argument("--threads", type=int, default=10, help="Number of threads for TCP scanning (default: 10). Max 50 for safety.")
+    if use_rich_output:
+        console.print(Text(banner_text, style="bold red"), justify="center")
+        console.rule("[bold cyan]SocketSniper Initializing[/bold cyan]")
+    else:
+        print(banner_text) # Plain print for fallback
+        print("--- SocketSniper Initializing ---")
 
 
-    args = parser.parse_args()
-
-    # Cap threads for safety/stability
+    rich_print(Padding(Text("Disclaimer: Use responsibly. Only scan targets you have explicit permission to test.", style="italic yellow"), (0,1)))
+    
     args.threads = max(1, min(args.threads, 50))
-
-
-    print("Disclaimer: Use responsibly. Only scan targets you have explicit permission to test.")
-    print("-" * 70) # Adjusted separator length
-
     target_host = args.target
     resolved_ip = resolve_host(target_host)
 
-    if not resolved_ip:
-        return
+    if not resolved_ip: return
 
-    print(f"Scanning Target: {target_host} (Resolved IP: {resolved_ip})")
+    scan_info_text = Text.assemble(
+        ("Scanning Target: ", "bold white"), (target_host, "bold cyan"),
+        (" (Resolved IP: ", "white"), (resolved_ip, "bold cyan"), (")", "white")
+    )
+    rich_print(Panel(scan_info_text, title="[bold]Target Information[/bold]", border_style="blue", expand=False))
 
-    scan_results = {
-        "tool_name": "SocketSniper",
-        "target_host": target_host,
-        "resolved_ip": resolved_ip,
-        "scan_timestamp": datetime.now().isoformat(),
-        "os_guess": "Not performed",
-        "ports": {} # Keyed by "port/protocol" e.g. "80/TCP"
-    }
+    scan_results = {"tool_name": "SocketSniper", "target_host": target_host, "resolved_ip": resolved_ip,
+                    "scan_timestamp": datetime.now().isoformat(), "os_guess": "Not performed", "ports": {}}
 
-    # Determine ports to scan
-    tcp_ports_to_scan = set()
-    udp_ports_to_scan = set()
-
-    if args.ports: # General ports for both TCP and UDP
-        parsed_general_ports = parse_ports(args.ports)
-        tcp_ports_to_scan.update(parsed_general_ports)
-        udp_ports_to_scan.update(parsed_general_ports)
+    tcp_ports_to_scan, udp_ports_to_scan = set(), set()
+    if args.ports: parsed_general = parse_ports(args.ports); tcp_ports_to_scan.update(parsed_general); udp_ports_to_scan.update(parsed_general)
+    if args.tcp_ports: tcp_ports_to_scan.update(parse_ports(args.tcp_ports))
+    if args.udp_ports: udp_ports_to_scan.update(parse_ports(args.udp_ports))
     
-    if args.tcp_ports: # Specific TCP ports
-        tcp_ports_to_scan.update(parse_ports(args.tcp_ports))
-    
-    if args.udp_ports: # Specific UDP ports
-        udp_ports_to_scan.update(parse_ports(args.udp_ports))
-    
-    # If no ports specified via any flag, use common defaults
     if not tcp_ports_to_scan and not udp_ports_to_scan:
-        print("No specific ports given, using common TCP and UDP ports.")
-        tcp_ports_to_scan.update(COMMON_TCP_PORTS.keys())
-        udp_ports_to_scan.update(COMMON_UDP_PORTS.keys())
-    elif not tcp_ports_to_scan and (args.ports or args.udp_ports) and not args.tcp_ports:
-        # If -p or -u were used, but not -t, and tcp_ports_to_scan is still empty,
-        # it means user might only want UDP from -p, or only specified UDP.
-        # So, we don't add default TCP in this case.
-        pass
-    elif not udp_ports_to_scan and (args.ports or args.tcp_ports) and not args.udp_ports:
-        # Similar logic for UDP.
-        pass
+        rich_print("[italic]No specific ports given, using common TCP and UDP ports.[/italic]")
+        tcp_ports_to_scan.update(COMMON_TCP_PORTS.keys()); udp_ports_to_scan.update(COMMON_UDP_PORTS.keys())
 
+    final_tcp_ports, final_udp_ports = sorted(list(tcp_ports_to_scan)), sorted(list(udp_ports_to_scan))
 
-    final_tcp_ports = sorted(list(tcp_ports_to_scan))
-    final_udp_ports = sorted(list(udp_ports_to_scan))
-
-
-    # --- OS Detection ---
     if not args.no_os_detect:
-        print("\n[+] Performing OS detection (via Ping TTL)...")
+        rich_print(Panel(Text("Performing OS detection (via Ping TTL)...", style="yellow"), title="[bold]OS Detection[/bold]", border_style="dim blue", expand=False))
         start_time_os = time.monotonic()
         os_guess = get_os_guess_ttl(resolved_ip)
         scan_results["os_guess"] = os_guess
         elapsed_time_os = time.monotonic() - start_time_os
-        print(f"  OS Guess: {os_guess} (completed in {elapsed_time_os:.2f}s)")
-    else:
-        print("\n[*] OS detection skipped by user.")
+        rich_print(f"  [bold]OS Guess:[/bold] {escape(os_guess)} ([italic]completed in {elapsed_time_os:.2f}s[/italic])")
+    else: rich_print(Panel("[italic]OS detection skipped by user.[/italic]", title="[bold]OS Detection[/bold]", border_style="dim blue"))
 
-    # --- TCP Scan ---
+    # Progress bar setup
+    progress_columns = [SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TaskProgressColumn(), TimeElapsedColumn()] if use_rich_output else []
+    
+    # --- TCP Scan with Rich Progress ---
     if final_tcp_ports:
-        print(f"\n[+] Starting TCP scan for {len(final_tcp_ports)} port(s) using {args.threads} thread(s)...")
-        start_time_tcp = time.monotonic()
+        section_title = f"TCP Scan ({len(final_tcp_ports)} ports, {args.threads} threads)"
+        rich_print(Panel(f"Starting TCP scan for {len(final_tcp_ports)} port(s)...", title=f"[bold]{section_title}[/bold]", border_style="green", expand=False))
         
-        tcp_port_q = final_tcp_ports[:] # Queue of ports to scan
-        results_lock = threading.Lock() # Lock for updating shared scan_results
+        tcp_results_intermediate = {} # Store results before adding to main dict to avoid thread issues with Rich updates
+        results_lock = threading.Lock()
 
-        def worker_tcp():
+        def worker_tcp(progress, task_id):
             while True:
                 port_to_scan = None
-                try:
-                    # Get port from queue (thread-safe due to list.pop() GIL behavior for simple ops)
-                    # For more complex queue management, use queue.Queue
-                    with results_lock: # Though pop itself is atomic, better to lock if list is small
-                        if not tcp_port_q: break
-                        port_to_scan = tcp_port_q.pop(0)
-                except IndexError:
-                    break # No more ports
+                with results_lock:
+                    if not final_tcp_ports_q: break
+                    port_to_scan = final_tcp_ports_q.pop(0)
                 
                 if port_to_scan is None: break
-
-
-                # print(f"  Scanning TCP port {port_to_scan}...") # Verbose
-                status, banner = tcp_scan_port(resolved_ip, port_to_scan, args.tcp_timeout)
                 
+                status, banner = tcp_scan_port(resolved_ip, port_to_scan, args.tcp_timeout)
                 port_key = f"{port_to_scan}/TCP"
-                port_details = {
-                    "protocol": "TCP",
-                    "status": status,
-                    "banner": banner if banner else "N/A",
-                    "service": "N/A"
-                }
+                port_details = {"protocol": "TCP", "status": status, "banner": banner or "N/A", "service": "N/A"}
 
                 if status == "Open":
                     port_details["service"] = get_service_name(port_to_scan, "TCP", banner)
-                    print(f"  TCP Port {port_to_scan}: {status} - {port_details['service']} - Banner: {banner[:60] if banner else 'N/A'}{'...' if banner and len(banner) > 60 else ''}")
-
                     if not args.no_ssl_check:
-                        # Heuristic for SSL/TLS services
-                        is_ssl_service = (
-                            port_to_scan in [443, 465, 993, 995, 8443] or
-                            "https" in port_details["service"].lower() or
-                            "smtps" in port_details["service"].lower() or
-                            "imaps" in port_details["service"].lower() or
-                            "pop3s" in port_details["service"].lower() or
-                            (banner and "starttls" in banner.lower() and port_to_scan in [25, 110, 143]) # STARTTLS hint
-                        )
-                        if is_ssl_service:
-                            print(f"    Performing SSL/TLS check for {resolved_ip}:{port_to_scan}...")
-                            check_ssl_tls(resolved_ip, port_to_scan, port_details) # Updates port_details directly
+                        is_ssl = (port_to_scan in [443,465,993,995,8443] or any(s in port_details["service"].lower() for s in ["https","smtps","imaps","pop3s"]) or (banner and "starttls" in banner.lower()))
+                        if is_ssl:
+                            # SSL check can be slow, consider if it should update progress description
+                            if use_rich_output and RICH_AVAILABLE: progress.update(task_id, description=f"TCP Scan: Port {port_to_scan} (SSL Check...)")
+                            check_ssl_tls(resolved_ip, port_to_scan, port_details)
                 
-                with results_lock:
-                    scan_results["ports"][port_key] = port_details
+                with results_lock: # Protect access to intermediate results
+                    tcp_results_intermediate[port_key] = port_details
+                if use_rich_output and RICH_AVAILABLE: progress.update(task_id, advance=1, description=f"TCP Scan: Port {port_to_scan}")
 
-        tcp_threads = []
-        for _ in range(args.threads):
-            thread = threading.Thread(target=worker_tcp)
-            tcp_threads.append(thread)
-            thread.start()
 
-        for thread in tcp_threads:
-            thread.join()
+        final_tcp_ports_q = final_tcp_ports[:] # Thread-safe queue copy
         
-        elapsed_time_tcp = time.monotonic() - start_time_tcp
-        print(f"[+] TCP scan finished in {elapsed_time_tcp:.2f}s.")
+        if use_rich_output and RICH_AVAILABLE:
+            with Progress(*progress_columns, console=console, transient=True) as progress:
+                task_id = progress.add_task(f"TCP Scan ({args.threads} threads)", total=len(final_tcp_ports))
+                tcp_threads = [threading.Thread(target=worker_tcp, args=(progress, task_id)) for _ in range(args.threads)]
+                for thread in tcp_threads: thread.start()
+                for thread in tcp_threads: thread.join()
+        else: # Fallback without Rich progress
+            tcp_threads = [threading.Thread(target=worker_tcp, args=(None, None)) for _ in range(args.threads)] # Pass None for progress and task_id
+            for thread in tcp_threads: thread.start()
+            for thread in tcp_threads: thread.join()
+            rich_print(f"[+] TCP scan finished.")
 
+        scan_results["ports"].update(tcp_results_intermediate) # Add collected results
 
-    # --- UDP Scan ---
+    # --- UDP Scan with Rich Progress ---
     if final_udp_ports:
-        print(f"\n[+] Starting UDP scan for {len(final_udp_ports)} port(s)... (Note: UDP scanning can be slow and less reliable)")
-        start_time_udp = time.monotonic()
-        # UDP scanning is often slower and done sequentially here for simplicity.
-        # Can be threaded similarly to TCP if desired, but each probe already has a timeout.
-        for port in final_udp_ports:
-            # print(f"  Scanning UDP port {port}...") # Verbose
-            status = udp_scan_port(resolved_ip, port, args.udp_timeout)
-            service = get_service_name(port, "UDP")
-            
-            port_key = f"{port}/UDP"
-            scan_results["ports"][port_key] = { # UDP results are simpler for now
-                "protocol": "UDP", "status": status, "service": service
-            }
-            if "Open" in status: # Includes "Open" and "Open|Filtered"
-                 print(f"  UDP Port {port}: {status} - {service}")
-        elapsed_time_udp = time.monotonic() - start_time_udp
-        print(f"[+] UDP scan finished in {elapsed_time_udp:.2f}s.")
-    else:
-        print("\n[*] No UDP ports selected for scanning.")
+        section_title = f"UDP Scan ({len(final_udp_ports)} ports)"
+        rich_print(Panel(f"Starting UDP scan for {len(final_udp_ports)} port(s)...", title=f"[bold]{section_title}[/bold]", border_style="magenta", expand=False))
+        
+        if use_rich_output and RICH_AVAILABLE:
+            with Progress(*progress_columns, console=console, transient=True) as progress:
+                task_id = progress.add_task("UDP Scan", total=len(final_udp_ports))
+                for port in final_udp_ports:
+                    status = udp_scan_port(resolved_ip, port, args.udp_timeout)
+                    service = get_service_name(port, "UDP")
+                    scan_results["ports"][f"{port}/UDP"] = {"protocol": "UDP", "status": status, "service": service}
+                    progress.update(task_id, advance=1, description=f"UDP Scan: Port {port}")
+        else: # Fallback without Rich progress
+            for i, port in enumerate(final_udp_ports):
+                status = udp_scan_port(resolved_ip, port, args.udp_timeout)
+                service = get_service_name(port, "UDP")
+                scan_results["ports"][f"{port}/UDP"] = {"protocol": "UDP", "status": status, "service": service}
+                if (i + 1) % 10 == 0 or i + 1 == len(final_udp_ports): # Print progress occasionally
+                     rich_print(f"  UDP Scan: {i+1}/{len(final_udp_ports)} ports scanned...")
+            rich_print(f"[+] UDP scan finished.")
 
 
-    # --- Reporting ---
-    print("\n[+] Generating reports and summary...")
-    if args.json:
-        generate_json_report(scan_results, args.json)
-    if args.csv:
-        generate_csv_report(scan_results, args.csv)
-    if args.html:
-        generate_html_report(scan_results, args.html)
+    # --- Reporting & Summary ---
+    rich_print(Panel("Generating reports and final summary...", title="[bold]Reporting[/bold]", border_style="blue", expand=False))
+    if args.json: generate_json_report(scan_results, args.json)
+    if args.csv: generate_csv_report(scan_results, args.csv)
+    if args.html: generate_html_report(scan_results, args.html)
 
-    # Always print a summary to console
-    print(f"\n--- SocketSniper Scan Summary for {target_host} ({resolved_ip}) ---")
-    print(f"OS Guess: {scan_results['os_guess']}")
-    
+    # Rich Table for Summary
+    summary_table = Table(title=f"SocketSniper Scan Summary for [bold cyan]{escape(target_host)}[/bold cyan] ([italic]{escape(resolved_ip)}[/italic])",
+                          box=HEAVY_HEAD if use_rich_output and RICH_AVAILABLE else None,
+                          header_style="bold magenta" if use_rich_output and RICH_AVAILABLE else "",
+                          show_lines=True if use_rich_output and RICH_AVAILABLE else False,
+                          expand=True)
+    if use_rich_output and RICH_AVAILABLE:
+        summary_table.add_column("Port", style="dim cyan", width=12)
+        summary_table.add_column("Protocol", width=8)
+        summary_table.add_column("Status", width=15)
+        summary_table.add_column("Service", style="yellow", width=20)
+        summary_table.add_column("Banner / SSL Details", no_wrap=False) # Allow wrapping for details
+    else: # Fallback table columns
+        summary_table.add_column("Port")
+        summary_table.add_column("Protocol")
+        summary_table.add_column("Status")
+        summary_table.add_column("Service")
+        summary_table.add_column("Banner / SSL Details")
+
+
     open_ports_found = False
-    # Sort results for display: by port number, then by protocol (TCP before UDP if same port num)
-    sorted_port_items = sorted(
-        scan_results["ports"].items(),
-        key=lambda item: (
-            int(item[0].split('/')[0]) if '/' in item[0] else int(item[0]), # Port number
-            item[1].get("protocol", "") # Protocol
-        )
-    )
+    sorted_port_items = sorted(scan_results["ports"].items(), key=lambda item: (int(str(item[0]).split('/')[0]), item[1].get("protocol", "")))
 
     for port_key, details in sorted_port_items:
         if not isinstance(details, dict): continue
-
-        if "Open" in details.get("status", ""): # Covers "Open" and "Open|Filtered"
+        status = details.get("status", "")
+        if "Open" in status: # Open or Open|Filtered
             open_ports_found = True
-            print(f"  Port {port_key}: {details['status']} - Service: {details.get('service', 'N/A')}")
-            if details.get('banner') and details['banner'] != 'N/A':
-                print(f"    Banner: {details['banner'][:70]}{'...' if len(details['banner']) > 70 else ''}")
+            port_str = escape(str(port_key))
+            protocol_str = escape(details.get("protocol", "N/A"))
+            status_str = escape(status)
+            service_str = escape(details.get("service", "N/A"))
             
+            # Style status
+            if use_rich_output and RICH_AVAILABLE:
+                if "Open" == status: status_str = Text(status, style="bold green")
+                elif "Open|Filtered" == status: status_str = Text(status, style="bold yellow")
+                elif "Closed" in status: status_str = Text(status, style="bold red")
+                else: status_str = Text(status, style="dim")
+
+
+            banner_ssl_info = Text() if use_rich_output and RICH_AVAILABLE else [] # Use Text for Rich, list of strings for fallback
+            
+            banner = details.get('banner', 'N/A')
+            if banner != 'N/A':
+                display_banner = escape(banner[:70]) + ('...' if len(banner) > 70 else '')
+                if use_rich_output and RICH_AVAILABLE: banner_ssl_info.append(f"Banner: {display_banner}\n", style="italic dim")
+                else: banner_ssl_info.append(f"Banner: {display_banner}")
+
             if "ssl_tls" in details and isinstance(details["ssl_tls"], dict) and details["ssl_tls"].get("enabled"):
-                ssl_summary = details["ssl_tls"]
-                print(f"    SSL/TLS: Enabled")
-                if ssl_summary.get("negotiated_cipher_details"):
-                    nc = ssl_summary["negotiated_cipher_details"]
-                    print(f"      Cipher: {nc.get('name','N/A')} ({nc.get('protocol_version','N/A')})")
-                    if ssl_summary.get("negotiated_cipher_is_weak"):
-                        print("      WARNING: Negotiated cipher is potentially WEAK.")
-                
-                if ssl_summary.get("certificate") and isinstance(ssl_summary["certificate"], dict):
-                    cert_expired = ssl_summary["certificate"].get("expired")
-                    if cert_expired is True:
-                        print("      WARNING: Certificate EXPIRED! (NotAfter: {ssl_summary['certificate'].get('notAfter','N/A')})")
-                    elif cert_expired is False:
-                         print(f"      Certificate Valid (NotAfter: {ssl_summary['certificate'].get('notAfter','N/A')})")
+                ssl = details["ssl_tls"]
+                if use_rich_output and RICH_AVAILABLE:
+                    banner_ssl_info.append("SSL/TLS Enabled:\n", style="bold")
+                    if ssl.get("negotiated_cipher_details"): nc = ssl["negotiated_cipher_details"]; banner_ssl_info.append(f"  Cipher: {escape(nc.get('name','N/A'))} ({escape(nc.get('protocol_version','N/A'))})\n")
+                    if ssl.get("negotiated_cipher_is_weak"): banner_ssl_info.append("  WARNING: Negotiated cipher is WEAK.\n", style="bold orange_red1")
+                    if ssl.get("certificate") and isinstance(ssl["certificate"], dict):
+                        cert = ssl["certificate"]
+                        if cert.get("expired") is True: banner_ssl_info.append(f"  WARNING: Cert EXPIRED! (NotAfter: {escape(cert.get('notAfter','N/A'))})\n", style="bold red")
+                        elif cert.get("expired") is False: banner_ssl_info.append(f"  Cert Valid (NotAfter: {escape(cert.get('notAfter','N/A'))})\n", style="green")
+                    if ssl.get("insecure_protocols_supported"): banner_ssl_info.append(f"  WARNING: Insecure protocols: {escape(', '.join(ssl['insecure_protocols_supported']))}\n", style="orange_red1")
+                    if ssl.get("error"): banner_ssl_info.append(f"  SSL Note: {escape(ssl['error'])}\n", style="dim")
+                else: # Fallback SSL info
+                    banner_ssl_info.append("SSL/TLS Enabled.")
+                    if ssl.get("negotiated_cipher_details"): nc = ssl["negotiated_cipher_details"]; banner_ssl_info.append(f"Cipher: {nc.get('name','N/A')} ({nc.get('protocol_version','N/A')})")
+                    if ssl.get("negotiated_cipher_is_weak"): banner_ssl_info.append("WARNING: Negotiated cipher WEAK.")
+                    # Add more fallback SSL details if needed
 
-
-                insec_protos = ssl_summary.get("insecure_protocols_supported", [])
-                if insec_protos:
-                    print(f"      WARNING: Insecure protocols supported: {', '.join(insec_protos)}")
-                
-                # weak_ciphers_list = ssl_summary.get("weak_ciphers_supported_by_server", [])
-                # if weak_ciphers_list and not ssl_summary.get("negotiated_cipher_is_weak"): # Avoid redundant if negotiated was already weak
-                #      print(f"      INFO: Server might support other weak ciphers: {', '.join(c.split('(')[0] for c in weak_ciphers_list if '(Negotiated' not in c)}")
-
-
-                if ssl_summary.get("error"):
-                    print(f"      SSL Note/Error: {ssl_summary['error']}")
             elif "ssl_tls" in details and isinstance(details["ssl_tls"], dict) and details["ssl_tls"].get("error"):
-                 print(f"    SSL/TLS Check Error: {details['ssl_tls']['error']}")
+                if use_rich_output and RICH_AVAILABLE: banner_ssl_info.append(f"SSL Check Error: {escape(details['ssl_tls']['error'])}\n", style="red")
+                else: banner_ssl_info.append(f"SSL Check Error: {details['ssl_tls']['error']}")
 
+            summary_table.add_row(port_str, protocol_str, status_str, service_str, banner_ssl_info if use_rich_output and RICH_AVAILABLE else "\n".join(banner_ssl_info) )
+
+    if use_rich_output:
+        os_panel_content = Text(escape(scan_results['os_guess']), style="white")
+        os_panel = Panel(os_panel_content, title="[bold]OS Guess[/bold]", border_style="blue", expand=False)
+        rich_print(os_panel)
+    else:
+        rich_print(f"OS Guess: {scan_results['os_guess']}") # Fallback print
 
     if not open_ports_found:
-        print("  No open or open|filtered ports found among scanned ports.")
+        no_ports_text = Text("No open or open|filtered ports found among scanned ports.", style="yellow")
+        if use_rich_output and RICH_AVAILABLE: summary_table.add_row(no_ports_text, span=5 if RICH_AVAILABLE else 1) # Span across columns if Rich
+        else: rich_print(str(no_ports_text))
 
 
-    print("\n--- Scan Complete ---")
-
+    rich_print(summary_table)
+    rich_print(Panel("[bold green]Scan Complete[/bold green]", border_style="green", expand=False, text_align="center"))
 
 if __name__ == "__main__":
+    # This check ensures Rich is only fully utilized if available AND not disabled by user
+    # The global `use_rich_output` is set in main() after parsing args.
+    # The initial `console` object (Rich or Fallback) is determined at the top.
     main()
