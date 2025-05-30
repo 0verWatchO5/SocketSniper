@@ -11,6 +11,8 @@ import threading
 from datetime import datetime
 from collections import defaultdict
 import time
+from rich.console import Console
+from rich.text import Text
 
 # --- Configuration ---
 DEFAULT_TCP_TIMEOUT = 1.0  # Default timeout for TCP connections in seconds
@@ -597,7 +599,10 @@ def generate_html_report(data, filename):
 
 # --- Main ---
 def main():
-    # ASCII Art Banner for SocketSniper
+    # Setup Rich Console
+    console = Console()
+
+    # ASCII Art Banner for SocketSniper (Red)
     banner = r"""
     ███████╗ ██████╗  ██████╗██╗  ██╗███████╗████████╗███████╗███╗   ██╗██╗██████╗ ███████╗██████╗ 
     ██╔════╝██╔═══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝██╔════╝████╗  ██║██║██╔══██╗██╔════╝██╔══██╗
@@ -606,8 +611,10 @@ def main():
     ███████║╚██████╔╝╚██████╗██║  ██╗███████╗   ██║   ███████║██║ ╚████║██║██║     ███████╗██║  ██║
     ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═══╝╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝
                         Deep Port Scanner & Fingerprinter
+                    Use responsibly and only on systems you have explicit permission to scan.
+                    Developed by: 0verWatchO5
     """
-    print(banner)
+    console.print(Text(banner, style="bold red"))
 
     parser = argparse.ArgumentParser(
         description="SocketSniper - Deep Port Scanner & Fingerprinter. Use responsibly and only on systems you have explicit permission to scan.",
