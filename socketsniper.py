@@ -13,6 +13,7 @@ import threading
 from datetime import datetime, timezone
 from collections import defaultdict
 import time
+import warnings
 from rich.console import Console
 from rich.text import Text
 from rich.table import Table
@@ -39,11 +40,13 @@ COMMON_UDP_PORTS = {
     1900: "SSDP", 4500: "IPsec NAT Traversal", 5353: "MDNS"
 }
 
-# Insecure SSL/TLS protocol versions to test (using modern ssl.TLSVersion enum)
+# Insecure SSL/TLS protocol version identifiers (integer values matching
+# the wire protocol numbers so we avoid referencing the deprecated
+# ssl.TLSVersion.SSLv3 / TLSv1 / TLSv1_1 enum members at import time).
 INSECURE_SSL_VERSIONS = {
-    "SSLv3": ssl.TLSVersion.SSLv3,
-    "TLSv1.0": ssl.TLSVersion.TLSv1,
-    "TLSv1.1": ssl.TLSVersion.TLSv1_1,
+    "SSLv3":   0x300,  # ssl.TLSVersion.SSLv3
+    "TLSv1.0": 0x301,  # ssl.TLSVersion.TLSv1
+    "TLSv1.1": 0x302,  # ssl.TLSVersion.TLSv1_1
 }
 
 # List of some known weak cipher suites (OpenSSL names)
@@ -278,19 +281,22 @@ def check_ssl_tls(hostname, port, results_dict):
         results_dict["ssl_tls"] = ssl_info
         return
 
-    # Test for insecure protocols using modern ssl.TLSVersion constraints
-    for proto_name, tls_version in INSECURE_SSL_VERSIONS.items():
+    # Test for insecure protocols. We intentionally probe deprecated TLS
+    # versions as part of security auditing, so suppress the warnings.
+    for proto_name, tls_version_int in INSECURE_SSL_VERSIONS.items():
         try:
             test_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             test_context.check_hostname = False
             test_context.verify_mode = ssl.CERT_NONE
-            test_context.minimum_version = tls_version
-            test_context.maximum_version = tls_version
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                test_context.minimum_version = ssl.TLSVersion(tls_version_int)
+                test_context.maximum_version = ssl.TLSVersion(tls_version_int)
 
             with socket.create_connection((hostname, port), timeout=ssl_timeout) as test_sock:
                 with test_context.wrap_socket(test_sock, server_hostname=hostname) as test_ssock:
                     ssl_info["insecure_protocols_supported"].append(f"{proto_name} (Server accepted: {test_ssock.version()})")
-        except (ssl.SSLError, socket.timeout, ConnectionRefusedError, OSError):
+        except (ssl.SSLError, socket.timeout, ConnectionRefusedError, OSError, ValueError):
             pass
 
     results_dict["ssl_tls"] = ssl_info
