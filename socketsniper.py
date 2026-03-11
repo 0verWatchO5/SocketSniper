@@ -10,13 +10,20 @@ import re
 import subprocess
 import platform
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 import time
 from rich.console import Console
 from rich.text import Text
+from rich.table import Table
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
+from rich.rule import Rule
+from rich.markup import escape
+from rich import box
 
 # --- Configuration ---
+console = Console()
 DEFAULT_TCP_TIMEOUT = 1.0  # Default timeout for TCP connections in seconds
 DEFAULT_UDP_TIMEOUT = 2.0  # Default timeout for UDP probes in seconds
 MAX_BANNER_SIZE = 1024     # Max size of banner to grab
@@ -32,12 +39,11 @@ COMMON_UDP_PORTS = {
     1900: "SSDP", 4500: "IPsec NAT Traversal", 5353: "MDNS"
 }
 
-# List of known weak/insecure SSL/TLS protocols
+# Insecure SSL/TLS protocol versions to test (using modern ssl.TLSVersion enum)
 INSECURE_SSL_VERSIONS = {
-    "SSLv2": ssl.PROTOCOL_SSLv23, # Placeholder, actual SSLv2 often disabled at compile time
-    "SSLv3": ssl.PROTOCOL_SSLv23,
-    "TLSv1.0": ssl.PROTOCOL_TLSv1,
-    "TLSv1.1": ssl.PROTOCOL_TLSv1_1,
+    "SSLv3": ssl.TLSVersion.SSLv3,
+    "TLSv1.0": ssl.TLSVersion.TLSv1,
+    "TLSv1.1": ssl.TLSVersion.TLSv1_1,
 }
 
 # List of some known weak cipher suites (OpenSSL names)
@@ -65,7 +71,7 @@ def resolve_host(hostname):
         ip_address = socket.gethostbyname(hostname)
         return ip_address
     except socket.gaierror:
-        print(f"Error: Could not resolve hostname '{hostname}'.")
+        console.print(f"[bold red]Error:[/] Could not resolve hostname '[bold]{escape(hostname)}[/]'.")
         return None
 
 def parse_ports(port_string):
@@ -84,14 +90,14 @@ def parse_ports(port_string):
                 if start <= end:
                     ports.update(range(start, end + 1))
                 else:
-                    print(f"Warning: Invalid port range '{part}' ignored (start > end).")
+                    console.print(f"[yellow]Warning:[/] Invalid port range '{escape(part)}' ignored (start > end).")
             except ValueError:
-                print(f"Warning: Invalid port range value in '{part}' ignored.")
+                console.print(f"[yellow]Warning:[/] Invalid port range value in '{escape(part)}' ignored.")
         else:
             try:
                 ports.add(int(part))
             except ValueError:
-                print(f"Warning: Invalid port value '{part}' ignored.")
+                console.print(f"[yellow]Warning:[/] Invalid port value '{escape(part)}' ignored.")
     return sorted(list(ports))
 
 # --- Scanning Functions ---
@@ -114,18 +120,16 @@ def tcp_scan_port(target_ip, port, timeout):
                 if port == 80: # HTTP
                     sock.sendall(b"HEAD / HTTP/1.1\r\nHost: " + target_ip.encode() + b"\r\nConnection: close\r\n\r\n")
                 elif port == 443: # HTTPS - banner grabbing handled by SSL check
-                    pass # Banner will be "N/A" here, SSL check will provide protocol details
+                    pass
                 elif port == 21: # FTP
-                    sock.settimeout(1.0) # FTP servers usually send banner immediately
+                    sock.settimeout(1.0)
                 # For other services, just try to receive immediately
                 if port != 443:
-                    # Short timeout for banner recv, as some services send it immediately
-                    # and others might wait for client input.
                     current_timeout = sock.gettimeout()
-                    sock.settimeout(min(0.5, current_timeout)) # Don't exceed original timeout
+                    sock.settimeout(min(0.5, current_timeout))
                     banner_bytes = sock.recv(MAX_BANNER_SIZE)
                     banner = banner_bytes.decode(errors='ignore').strip()
-                    sock.settimeout(current_timeout) # Restore original timeout
+                    sock.settimeout(current_timeout)
             except socket.timeout:
                 banner = "N/A (Timeout receiving banner)"
             except Exception as e:
@@ -152,11 +156,6 @@ def udp_scan_port(target_ip, port, timeout):
         sock.settimeout(timeout)
         sock.sendto(b'', (target_ip, port)) # Send empty UDP packet
         try:
-            # For some common UDP services, a specific probe might elicit a better response.
-            # Example: DNS query for port 53
-            # if port == 53:
-            #    sock.sendto(b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01', (target_ip, port))
-            
             sock.recvfrom(1024) # buffer size
             return "Open"
         except socket.timeout:
@@ -191,7 +190,6 @@ def get_service_name(port, protocol, banner=None):
         elif "pop3" in banner_lower: service = "POP3"
         elif "imap" in banner_lower: service = "IMAP"
         elif "telnet" in banner_lower: service = "Telnet"
-        # Add more banner checks as needed
     return service
 
 
@@ -200,14 +198,13 @@ def check_ssl_tls(hostname, port, results_dict):
     Performs SSL/TLS checks on a given host and port.
     Updates results_dict with SSL/TLS information.
     """
-    # Use a specific timeout for SSL/TLS checks, can be longer than general TCP connect
-    ssl_timeout = max(DEFAULT_TCP_TIMEOUT, 2.0) # Ensure at least 2s for SSL handshake
+    ssl_timeout = max(DEFAULT_TCP_TIMEOUT, 2.0)
 
     ssl_info = {
         "enabled": False,
         "certificate": None,
         "insecure_protocols_supported": [],
-        "weak_ciphers_supported_by_server": [], # Ciphers server might support (advanced)
+        "weak_ciphers_supported_by_server": [],
         "negotiated_cipher_details": None,
         "negotiated_cipher_is_weak": False,
         "error": None
@@ -215,10 +212,9 @@ def check_ssl_tls(hostname, port, results_dict):
 
     # Standard connection to get cert and negotiated cipher
     try:
-        context = ssl.create_default_context()
-        # Allow connection even if cert is self-signed for info gathering
-        context.check_hostname = False 
-        context.verify_mode = ssl.CERT_NONE 
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
 
         with socket.create_connection((hostname, port), timeout=ssl_timeout) as sock:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
@@ -234,35 +230,29 @@ def check_ssl_tls(hostname, port, results_dict):
                         "notAfter": cert.get("notAfter"),
                     }
                     try:
-                        # Ensure Z is appended if missing for UTC, strptime can be picky
                         not_after_str = cert["notAfter"]
-                        if not not_after_str.endswith("Z"): # some certs might not have Z
-                             if " GMT" in not_after_str: # Handle "GMT"
+                        if not not_after_str.endswith("Z"):
+                             if " GMT" in not_after_str:
                                  not_after_str = not_after_str.replace(" GMT","Z")
-                             # else assume UTC if no timezone info and no Z
-                        
-                        # Try multiple formats for date parsing
+
                         parsed_date = None
                         for fmt in ("%b %d %H:%M:%S %Y %Z", "%Y%m%d%H%M%SZ", "%Y%m%d%H%M%S%z"):
                             try:
                                 parsed_date = datetime.strptime(not_after_str, fmt)
-                                if parsed_date.tzinfo is None: # If naive, assume UTC
-                                     parsed_date = parsed_date.replace(tzinfo=datetime.timezone.utc)
+                                if parsed_date.tzinfo is None:
+                                     parsed_date = parsed_date.replace(tzinfo=timezone.utc)
                                 break
                             except ValueError:
                                 continue
-                        
+
                         if parsed_date:
-                            if parsed_date < datetime.now(datetime.timezone.utc):
-                                ssl_info["certificate"]["expired"] = True
-                            else:
-                                ssl_info["certificate"]["expired"] = False
+                            ssl_info["certificate"]["expired"] = parsed_date < datetime.now(timezone.utc)
                         else:
                              ssl_info["certificate"]["expired"] = "Error parsing date"
 
                     except Exception as e_date:
                         ssl_info["certificate"]["expired"] = f"Error parsing date ({e_date})"
-                
+
                 negotiated_cipher = ssock.cipher()
                 if negotiated_cipher:
                     ssl_info["negotiated_cipher_details"] = {
@@ -273,7 +263,7 @@ def check_ssl_tls(hostname, port, results_dict):
                     for weak_pattern, desc in WEAK_CIPHERS:
                         if weak_pattern.lower() in negotiated_cipher[0].lower():
                             ssl_info["negotiated_cipher_is_weak"] = True
-                            ssl_info["weak_ciphers_supported_by_server"].append(f"{negotiated_cipher[0]} (Negotiated - {desc})") # Mark as negotiated
+                            ssl_info["weak_ciphers_supported_by_server"].append(f"{negotiated_cipher[0]} (Negotiated - {desc})")
                             break
     except ssl.SSLError as e:
         ssl_info["error"] = f"SSL Error: {e}"
@@ -284,45 +274,23 @@ def check_ssl_tls(hostname, port, results_dict):
     except Exception as e:
         ssl_info["error"] = f"Generic error during SSL/TLS setup: {e}"
 
-    if not ssl_info["enabled"] and ssl_info["error"]: # If initial connection failed, don't try protocols
+    if not ssl_info["enabled"] and ssl_info["error"]:
         results_dict["ssl_tls"] = ssl_info
         return
 
-    # Test for insecure protocols
-    for proto_name, proto_val_or_const in INSECURE_SSL_VERSIONS.items():
-        # For PROTOCOL_SSLv23, we need to set options to limit to SSLv2 or SSLv3
-        # For specific versions like PROTOCOL_TLSv1, it's more direct.
-        test_context = None
+    # Test for insecure protocols using modern ssl.TLSVersion constraints
+    for proto_name, tls_version in INSECURE_SSL_VERSIONS.items():
         try:
-            if proto_name == "SSLv2": # SSLv2 is tricky, often disabled. PROTOCOL_SSLv2 is usually not available.
-                                     # Try to force via options on SSLv23 if possible.
-                test_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-                test_context.options |= ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2 | ssl.OP_NO_TLSv1_3
-            elif proto_name == "SSLv3":
-                test_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23) # Start with broader context
-                test_context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2 | ssl.OP_NO_TLSv1_3
-                # Or try specific if available:
-                # test_context = ssl.SSLContext(ssl.PROTOCOL_SSLv3) # This might fail if SSLv3 support is compiled out
-            else: # For TLSv1.0, TLSv1.1
-                 test_context = ssl.SSLContext(proto_val_or_const)
-
-            if not test_context: continue
-
+            test_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             test_context.check_hostname = False
             test_context.verify_mode = ssl.CERT_NONE
-            # Optionally, try to set only very basic ciphers to increase chance of protocol acceptance if ciphers are an issue
-            # test_context.set_ciphers('DEFAULT') # or even 'ALL:@SECLEVEL=0' if desperate, but be careful
+            test_context.minimum_version = tls_version
+            test_context.maximum_version = tls_version
 
             with socket.create_connection((hostname, port), timeout=ssl_timeout) as test_sock:
                 with test_context.wrap_socket(test_sock, server_hostname=hostname) as test_ssock:
-                    # If connection succeeds, the server supports this protocol
                     ssl_info["insecure_protocols_supported"].append(f"{proto_name} (Server accepted: {test_ssock.version()})")
-        except (ssl.SSLError, socket.timeout, ConnectionRefusedError, ValueError) as e_proto:
-            # ValueError can happen if protocol constant is bad or options are conflicting
-            # print(f"Note: Could not test {proto_name} for {hostname}:{port} - {type(e_proto).__name__}: {e_proto}")
-            pass # Expected if server doesn't support it, or other SSL issue like no common ciphers
-        except Exception as e_generic_proto:
-            # print(f"Note: Generic error testing {proto_name} for {hostname}:{port} - {e_generic_proto}")
+        except (ssl.SSLError, socket.timeout, ConnectionRefusedError, OSError):
             pass
 
     results_dict["ssl_tls"] = ssl_info
@@ -335,43 +303,39 @@ def get_os_guess_ttl(target_ip):
     Returns: OS guess string or "Unknown"
     """
     try:
-        # Determine ping parameters based on OS
         system = platform.system().lower()
         if system == 'windows':
-            command = ['ping', '-n', '1', '-w', '1000', target_ip] # 1 packet, 1000ms timeout
+            command = ['ping', '-n', '1', '-w', '1000', target_ip]
         elif system == 'linux':
-            command = ['ping', '-c', '1', '-W', '1', target_ip]    # 1 packet, 1s timeout
-        elif system == 'darwin': # macOS
-            command = ['ping', '-c', '1', '-t', '1', target_ip]    # 1 packet, 1s timeout
-        else: # Other OS (e.g. BSD) might use -c and -t or -W. Defaulting to Linux-like.
+            command = ['ping', '-c', '1', '-W', '1', target_ip]
+        elif system == 'darwin':
+            command = ['ping', '-c', '1', '-t', '1', target_ip]
+        else:
             command = ['ping', '-c', '1', '-W', '1', target_ip]
 
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate(timeout=2.5) # Process timeout slightly longer than ping timeout
-        
+        stdout, stderr = proc.communicate(timeout=2.5)
+
         output = stdout.decode(errors='ignore').lower()
-        
+
         ttl_match = re.search(r"ttl=(\d+)", output)
         if ttl_match:
             ttl = int(ttl_match.group(1))
-            # Common TTL starting points (these can vary due to hops)
             if ttl > 128 and ttl <= 255 : return f"Solaris/AIX/Cisco (TTL: {ttl}, Original ~255)"
             elif ttl > 64 and ttl <= 128: return f"Windows (TTL: {ttl}, Original ~128)"
             elif ttl > 32 and ttl <= 64 : return f"Linux/Unix (TTL: {ttl}, Original ~64)"
             elif ttl <= 32             : return f"Linux/Unix (TTL: {ttl}, Original ~32 or many hops)"
             else: return f"Unknown (TTL: {ttl})"
         else:
-            # Fallback for different ping output formats if regex fails
             if "ttl=" in output:
                 return "OS (TTL found, specific value parsing failed)"
-            if proc.returncode == 0: # Ping succeeded but no TTL? Unlikely but possible.
+            if proc.returncode == 0:
                 return "Unknown (Ping success, but no TTL in output)"
-            else: # Ping failed
+            else:
                 error_output = stderr.decode(errors='ignore').lower().strip()
                 if "host unreachable" in error_output: return "Unknown (Host Unreachable)"
-                if "request timed out" in output: return "Unknown (Ping Request Timed Out)" # Some pings output timeout to stdout
+                if "request timed out" in output: return "Unknown (Ping Request Timed Out)"
                 return f"Unknown (Ping failed: {error_output[:50]})"
-
 
     except subprocess.TimeoutExpired:
         return "Unknown (Ping command timed out)"
@@ -387,37 +351,34 @@ def generate_json_report(data, filename):
     """Generates a JSON report."""
     try:
         with open(filename, 'w') as f:
-            json.dump(data, f, indent=4, default=str) # default=str for datetime
-        print(f"JSON report saved to {filename}")
+            json.dump(data, f, indent=4, default=str)
+        console.print(f"  [green]JSON report saved to[/] [bold]{escape(filename)}[/]")
     except IOError as e:
-        print(f"Error saving JSON report to {filename}: {e}")
+        console.print(f"  [red]Error saving JSON report to {escape(filename)}: {e}[/]")
 
 def generate_csv_report(data, filename):
     """Generates a CSV report."""
     if not data.get("ports"):
-        print("No port data to generate CSV report.")
+        console.print("  [yellow]No port data to generate CSV report.[/]")
         return
-    
+
     try:
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
-            # Define header, including SSL fields conditionally
             header = ["Host", "Port", "Protocol", "Status", "Service", "Banner"]
-            # Check if any port has SSL info to decide if SSL columns are needed
             has_ssl_info = any("ssl_tls" in port_info for port_info in data["ports"].values() if isinstance(port_info, dict))
 
             if has_ssl_info:
                 header.extend([
-                    "SSL Enabled", "SSL Error", 
-                    "Cert Subject CN", "Cert Issuer CN", "Cert Expired", "Cert NotAfter", 
+                    "SSL Enabled", "SSL Error",
+                    "Cert Subject CN", "Cert Issuer CN", "Cert Expired", "Cert NotAfter",
                     "Insecure Protocols Supported", "Negotiated Cipher", "Negotiated Cipher Weak"
                 ])
             writer.writerow(header)
 
             for port_num_key, port_info in data["ports"].items():
-                if not isinstance(port_info, dict): continue # Skip if port_info is not a dict (e.g. malformed)
+                if not isinstance(port_info, dict): continue
 
-                # Handle combined keys like "80/TCP" or just port numbers
                 port_num_str = str(port_num_key)
                 if "/" in port_num_str:
                     port_val = port_num_str.split("/")[0]
@@ -437,27 +398,26 @@ def generate_csv_report(data, filename):
                         row.extend([
                             ssl_data.get("enabled", False),
                             ssl_data.get("error", "N/A"),
-                            cert_info.get("subject", {}).get("commonName", "N/A"),
-                            cert_info.get("issuer", {}).get("commonName", "N/A"),
-                            cert_info.get("expired", "N/A"),
-                            cert_info.get("notAfter", "N/A"),
+                            cert_info.get("subject", {}).get("commonName", "N/A") if cert_info else "N/A",
+                            cert_info.get("issuer", {}).get("commonName", "N/A") if cert_info else "N/A",
+                            cert_info.get("expired", "N/A") if cert_info else "N/A",
+                            cert_info.get("notAfter", "N/A") if cert_info else "N/A",
                             ", ".join(ssl_data.get("insecure_protocols_supported", [])),
-                            negotiated_cipher.get("name", "N/A"),
+                            negotiated_cipher.get("name", "N/A") if negotiated_cipher else "N/A",
                             ssl_data.get("negotiated_cipher_is_weak", False)
                         ])
                     else:
-                        row.extend(["N/A"] * 9) # Pad with N/A for SSL columns
+                        row.extend(["N/A"] * 9)
                 writer.writerow(row)
-        print(f"CSV report saved to {filename}")
+        console.print(f"  [green]CSV report saved to[/] [bold]{escape(filename)}[/]")
     except IOError as e:
-        print(f"Error saving CSV report to {filename}: {e}")
+        console.print(f"  [red]Error saving CSV report to {escape(filename)}: {e}[/]")
     except Exception as e_csv:
-        print(f"An unexpected error occurred during CSV generation: {e_csv}")
+        console.print(f"  [red]Unexpected error during CSV generation: {e_csv}[/]")
 
 
 def generate_html_report(data, filename):
     """Generates an HTML report."""
-    # Basic HTML structure and styling
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -494,7 +454,7 @@ def generate_html_report(data, filename):
             <div class="summary-item"><strong>Target Host:</strong> {data.get('target_host', 'N/A')}</div>
             <div class="summary-item"><strong>Resolved IP:</strong> {data.get('resolved_ip', 'N/A')}</div>
             <div class="summary-item"><strong>Scan Timestamp:</strong> {data.get('scan_timestamp', 'N/A')}</div>
-            
+
             <h2>OS Guess (via Ping TTL)</h2>
             <p>{data.get('os_guess', 'Not performed or failed')}</p>
 
@@ -518,15 +478,13 @@ def generate_html_report(data, filename):
                 </thead>
                 <tbody>
         """
-        # Sort ports: numeric first, then string keys (like "80/UDP")
         sorted_ports = sorted(data["ports"].items(), key=lambda item: (isinstance(item[0], int), item[0]))
 
         for port_key, info in sorted_ports:
-            if not isinstance(info, dict): continue # Ensure info is a dictionary
+            if not isinstance(info, dict): continue
 
             status_class = "status-" + info.get('status', 'unknown').lower().replace("|", "").replace(" (timeout)", "filtered").replace(" (error)", "error")
-            
-            port_display = str(port_key) # Default display for port key
+            port_display = str(port_key)
 
             html_content += f"""
                 <tr>
@@ -539,7 +497,7 @@ def generate_html_report(data, filename):
             """
             if "ssl_tls" in info:
                 ssl_data = info["ssl_tls"]
-                if isinstance(ssl_data, dict): # Ensure ssl_data is a dictionary
+                if isinstance(ssl_data, dict):
                     html_content += "<div class='ssl-details'>"
                     if ssl_data.get("enabled"):
                         html_content += f"<p><strong>SSL/TLS Enabled:</strong> Yes</p>"
@@ -548,10 +506,10 @@ def generate_html_report(data, filename):
                             html_content += f"<p><strong>Negotiated:</strong> {nc.get('name','N/A')} ({nc.get('protocol_version','N/A')})</p>"
                             if ssl_data.get("negotiated_cipher_is_weak"):
                                 html_content += f"<p class='warning'><strong>Warning: Negotiated cipher is potentially weak.</strong></p>"
-                        
+
                         if ssl_data.get("certificate"):
                             cert = ssl_data["certificate"]
-                            if isinstance(cert, dict): # Ensure cert is a dictionary
+                            if isinstance(cert, dict):
                                 html_content += f"<p><strong>Cert Subject:</strong> {cert.get('subject', {}).get('commonName', 'N/A')}</p>"
                                 html_content += f"<p><strong>Cert Issuer:</strong> {cert.get('issuer', {}).get('commonName', 'N/A')}</p>"
                                 html_content += f"<p><strong>Cert Valid:</strong> Not Before: {cert.get('notBefore', 'N/A')}, Not After: {cert.get('notAfter', 'N/A')}</p>"
@@ -567,7 +525,7 @@ def generate_html_report(data, filename):
                             html_content += f"<p class='warning'><strong>Insecure Protocols Supported:</strong> {', '.join(insec_protos)}</p>"
                         else:
                             html_content += f"<p><strong>Insecure Protocols Supported:</strong> None detected</p>"
-                        
+
                         weak_ciphers_list = ssl_data.get("weak_ciphers_supported_by_server", [])
                         if weak_ciphers_list:
                              html_content += f"<p class='warning'><strong>Potentially Weak Ciphers (Server List/Negotiated):</strong> {', '.join(weak_ciphers_list)}</p>"
@@ -594,33 +552,33 @@ def generate_html_report(data, filename):
     try:
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(html_content)
-        print(f"HTML report saved to {filename}")
+        console.print(f"  [green]HTML report saved to[/] [bold]{escape(filename)}[/]")
     except IOError as e:
-        print(f"Error saving HTML report to {filename}: {e}")
+        console.print(f"  [red]Error saving HTML report to {escape(filename)}: {e}[/]")
 
 
 # --- Main ---
 def main():
-    # Setup Rich Console
-    console = Console()
+    # ASCII Art Banner for SocketSniper
+    banner_text = r"""
+ ███████╗ ██████╗  ██████╗██╗  ██╗███████╗████████╗███████╗███╗   ██╗██╗██████╗ ███████╗██████╗ 
+ ██╔════╝██╔═══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝██╔════╝████╗  ██║██║██╔══██╗██╔════╝██╔══██╗
+ ███████╗██║   ██║██║     █████╔╝ █████╗     ██║   ███████╗██╔██╗ ██║██║██████╔╝█████╗  ██████╔╝
+ ╚════██║██║   ██║██║     ██╔═██╗ ██╔══╝     ██║   ╚════██║██║╚██╗██║██║██╔═══╝ ██╔══╝  ██╔══██╗
+ ███████║╚██████╔╝╚██████╗██║  ██╗███████╗   ██║   ███████║██║ ╚████║██║██║     ███████╗██║  ██║
+ ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═══╝╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝"""
 
-    # ASCII Art Banner for SocketSniper (Red)
-    banner = r"""
-    ███████╗ ██████╗  ██████╗██╗  ██╗███████╗████████╗███████╗███╗   ██╗██╗██████╗ ███████╗██████╗ 
-    ██╔════╝██╔═══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝██╔════╝████╗  ██║██║██╔══██╗██╔════╝██╔══██╗
-    ███████╗██║   ██║██║     █████╔╝ █████╗     ██║   ███████╗██╔██╗ ██║██║██████╔╝█████╗  ██████╔╝
-    ╚════██║██║   ██║██║     ██╔═██╗ ██╔══╝     ██║   ╚════██║██║╚██╗██║██║██╔═══╝ ██╔══╝  ██╔══██╗
-    ███████║╚██████╔╝╚██████╗██║  ██╗███████╗   ██║   ███████║██║ ╚████║██║██║     ███████╗██║  ██║
-    ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═══╝╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝
-                        Deep Port Scanner & Fingerprinter
-                    Use responsibly and only on systems you have explicit permission to scan.
-                    Developed by: 0verWatchO5
-    """
-    console.print(Text(banner, style="bold red"))
+    console.print(Panel(
+        Text(banner_text, style="bold red"),
+        subtitle="[bold]Deep Port Scanner & Fingerprinter[/] [dim]by[/] [bold cyan]0verWatchO5[/]",
+        border_style="red",
+        padding=(0, 1),
+    ))
+    console.print()
 
     parser = argparse.ArgumentParser(
         description="SocketSniper - Deep Port Scanner & Fingerprinter. Use responsibly and only on systems you have explicit permission to scan.",
-        formatter_class=argparse.RawTextHelpFormatter # To keep banner formatting in help
+        formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("target", help="Target hostname or IP address.")
     parser.add_argument("-p", "--ports", help="Comma-separated ports/ranges to scan for both TCP and UDP (e.g., '21-23,80,443,1000-1005'). Overrides common ports.", default=None)
@@ -635,15 +593,11 @@ def main():
     parser.add_argument("--html", metavar="FILE", help="Export results to HTML file.")
     parser.add_argument("--threads", type=int, default=10, help="Number of threads for TCP scanning (default: 10). Max 50 for safety.")
 
-
     args = parser.parse_args()
-
-    # Cap threads for safety/stability
     args.threads = max(1, min(args.threads, 50))
 
-
-    print("Disclaimer: Use responsibly. Only scan targets you have explicit permission to test.")
-    print("-" * 70) # Adjusted separator length
+    console.print("[bold yellow]Warning:[/] Use responsibly. Only scan targets you have explicit permission to test.")
+    console.print()
 
     target_host = args.target
     resolved_ip = resolve_host(target_host)
@@ -651,7 +605,10 @@ def main():
     if not resolved_ip:
         return
 
-    print(f"Scanning Target: {target_host} (Resolved IP: {resolved_ip})")
+    console.print(Rule("[bold blue]Target Information[/]", style="blue"))
+    console.print(f"  [bold]Target:[/]       {escape(target_host)}")
+    console.print(f"  [bold]Resolved IP:[/]  {resolved_ip}")
+    console.print()
 
     scan_results = {
         "tool_name": "SocketSniper",
@@ -659,214 +616,331 @@ def main():
         "resolved_ip": resolved_ip,
         "scan_timestamp": datetime.now().isoformat(),
         "os_guess": "Not performed",
-        "ports": {} # Keyed by "port/protocol" e.g. "80/TCP"
+        "ports": {}
     }
 
     # Determine ports to scan
     tcp_ports_to_scan = set()
     udp_ports_to_scan = set()
 
-    if args.ports: # General ports for both TCP and UDP
+    if args.ports:
         parsed_general_ports = parse_ports(args.ports)
         tcp_ports_to_scan.update(parsed_general_ports)
         udp_ports_to_scan.update(parsed_general_ports)
-    
-    if args.tcp_ports: # Specific TCP ports
+
+    if args.tcp_ports:
         tcp_ports_to_scan.update(parse_ports(args.tcp_ports))
-    
-    if args.udp_ports: # Specific UDP ports
+
+    if args.udp_ports:
         udp_ports_to_scan.update(parse_ports(args.udp_ports))
-    
-    # If no ports specified via any flag, use common defaults
+
     if not tcp_ports_to_scan and not udp_ports_to_scan:
-        print("No specific ports given, using common TCP and UDP ports.")
+        console.print("[dim]No specific ports given, using common TCP and UDP ports.[/]")
         tcp_ports_to_scan.update(COMMON_TCP_PORTS.keys())
         udp_ports_to_scan.update(COMMON_UDP_PORTS.keys())
     elif not tcp_ports_to_scan and (args.ports or args.udp_ports) and not args.tcp_ports:
-        # If -p or -u were used, but not -t, and tcp_ports_to_scan is still empty,
-        # it means user might only want UDP from -p, or only specified UDP.
-        # So, we don't add default TCP in this case.
         pass
     elif not udp_ports_to_scan and (args.ports or args.tcp_ports) and not args.udp_ports:
-        # Similar logic for UDP.
         pass
-
 
     final_tcp_ports = sorted(list(tcp_ports_to_scan))
     final_udp_ports = sorted(list(udp_ports_to_scan))
 
-
     # --- OS Detection ---
     if not args.no_os_detect:
-        print("\n[+] Performing OS detection (via Ping TTL)...")
-        start_time_os = time.monotonic()
-        os_guess = get_os_guess_ttl(resolved_ip)
-        scan_results["os_guess"] = os_guess
-        elapsed_time_os = time.monotonic() - start_time_os
-        print(f"  OS Guess: {os_guess} (completed in {elapsed_time_os:.2f}s)")
+        console.print(Rule("[bold blue]OS Detection[/]", style="blue"))
+        with console.status("[bold cyan]Detecting OS via Ping TTL...", spinner="dots"):
+            start_time_os = time.monotonic()
+            os_guess = get_os_guess_ttl(resolved_ip)
+            scan_results["os_guess"] = os_guess
+            elapsed_time_os = time.monotonic() - start_time_os
+        console.print(f"  [bold]OS Guess:[/] {escape(os_guess)} [dim]({elapsed_time_os:.2f}s)[/]")
+        console.print()
     else:
-        print("\n[*] OS detection skipped by user.")
+        console.print("[dim]OS detection skipped by user.[/]")
+        console.print()
 
     # --- TCP Scan ---
     if final_tcp_ports:
-        print(f"\n[+] Starting TCP scan for {len(final_tcp_ports)} port(s) using {args.threads} thread(s)...")
+        console.print(Rule(f"[bold blue]TCP Scan[/] [dim]({len(final_tcp_ports)} ports, {args.threads} threads)[/]", style="blue"))
         start_time_tcp = time.monotonic()
-        
-        tcp_port_q = final_tcp_ports[:] # Queue of ports to scan
-        results_lock = threading.Lock() # Lock for updating shared scan_results
 
-        def worker_tcp():
-            while True:
-                port_to_scan = None
-                try:
-                    # Get port from queue (thread-safe due to list.pop() GIL behavior for simple ops)
-                    # For more complex queue management, use queue.Queue
-                    with results_lock: # Though pop itself is atomic, better to lock if list is small
-                        if not tcp_port_q: break
+        tcp_port_q = final_tcp_ports[:]
+        results_lock = threading.Lock()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=40),
+            MofNCompleteColumn(),
+            TextColumn("[dim]ports[/]"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            tcp_task = progress.add_task("TCP Scanning", total=len(final_tcp_ports))
+
+            def worker_tcp():
+                while True:
+                    port_to_scan = None
+                    with results_lock:
+                        if not tcp_port_q:
+                            break
                         port_to_scan = tcp_port_q.pop(0)
-                except IndexError:
-                    break # No more ports
-                
-                if port_to_scan is None: break
+                    if port_to_scan is None:
+                        break
 
+                    status, banner = tcp_scan_port(resolved_ip, port_to_scan, args.tcp_timeout)
 
-                # print(f"  Scanning TCP port {port_to_scan}...") # Verbose
-                status, banner = tcp_scan_port(resolved_ip, port_to_scan, args.tcp_timeout)
-                
-                port_key = f"{port_to_scan}/TCP"
-                port_details = {
-                    "protocol": "TCP",
-                    "status": status,
-                    "banner": banner if banner else "N/A",
-                    "service": "N/A"
-                }
+                    port_key = f"{port_to_scan}/TCP"
+                    port_details = {
+                        "protocol": "TCP",
+                        "status": status,
+                        "banner": banner if banner else "N/A",
+                        "service": "N/A"
+                    }
 
-                if status == "Open":
-                    port_details["service"] = get_service_name(port_to_scan, "TCP", banner)
-                    print(f"  TCP Port {port_to_scan}: {status} - {port_details['service']} - Banner: {banner[:60] if banner else 'N/A'}{'...' if banner and len(banner) > 60 else ''}")
+                    if status == "Open":
+                        port_details["service"] = get_service_name(port_to_scan, "TCP", banner)
+                        banner_short = (banner[:50] + "...") if banner and len(banner) > 50 else (banner or "N/A")
+                        console.print(f"  [green]\u25cf[/] TCP [bold]{port_to_scan}[/] [green]Open[/] \u2014 {escape(port_details['service'])} [dim]| {escape(banner_short)}[/]")
 
-                    if not args.no_ssl_check:
-                        # Heuristic for SSL/TLS services
-                        is_ssl_service = (
-                            port_to_scan in [443, 465, 993, 995, 8443] or
-                            "https" in port_details["service"].lower() or
-                            "smtps" in port_details["service"].lower() or
-                            "imaps" in port_details["service"].lower() or
-                            "pop3s" in port_details["service"].lower() or
-                            (banner and "starttls" in banner.lower() and port_to_scan in [25, 110, 143]) # STARTTLS hint
-                        )
-                        if is_ssl_service:
-                            print(f"    Performing SSL/TLS check for {resolved_ip}:{port_to_scan}...")
-                            check_ssl_tls(resolved_ip, port_to_scan, port_details) # Updates port_details directly
-                
-                with results_lock:
-                    scan_results["ports"][port_key] = port_details
+                        if not args.no_ssl_check:
+                            is_ssl_service = (
+                                port_to_scan in [443, 465, 993, 995, 8443] or
+                                "https" in port_details["service"].lower() or
+                                "smtps" in port_details["service"].lower() or
+                                "imaps" in port_details["service"].lower() or
+                                "pop3s" in port_details["service"].lower() or
+                                (banner and "starttls" in banner.lower() and port_to_scan in [25, 110, 143])
+                            )
+                            if is_ssl_service:
+                                console.print(f"    [dim]Checking SSL/TLS on port {port_to_scan}...[/]")
+                                check_ssl_tls(resolved_ip, port_to_scan, port_details)
 
-        tcp_threads = []
-        for _ in range(args.threads):
-            thread = threading.Thread(target=worker_tcp)
-            tcp_threads.append(thread)
-            thread.start()
+                    with results_lock:
+                        scan_results["ports"][port_key] = port_details
 
-        for thread in tcp_threads:
-            thread.join()
-        
+                    progress.advance(tcp_task)
+
+            tcp_threads = []
+            for _ in range(args.threads):
+                thread = threading.Thread(target=worker_tcp)
+                tcp_threads.append(thread)
+                thread.start()
+
+            for thread in tcp_threads:
+                thread.join()
+
         elapsed_time_tcp = time.monotonic() - start_time_tcp
-        print(f"[+] TCP scan finished in {elapsed_time_tcp:.2f}s.")
-
+        console.print(f"  [bold green]TCP scan finished[/] [dim]in {elapsed_time_tcp:.2f}s[/]")
+        console.print()
+    else:
+        console.print("[dim]No TCP ports selected for scanning.[/]")
+        console.print()
 
     # --- UDP Scan ---
     if final_udp_ports:
-        print(f"\n[+] Starting UDP scan for {len(final_udp_ports)} port(s)... (Note: UDP scanning can be slow and less reliable)")
+        console.print(Rule(f"[bold blue]UDP Scan[/] [dim]({len(final_udp_ports)} ports)[/]", style="blue"))
+        console.print("  [dim]Note: UDP scanning can be slow and less reliable[/]")
         start_time_udp = time.monotonic()
-        # UDP scanning is often slower and done sequentially here for simplicity.
-        # Can be threaded similarly to TCP if desired, but each probe already has a timeout.
-        for port in final_udp_ports:
-            # print(f"  Scanning UDP port {port}...") # Verbose
-            status = udp_scan_port(resolved_ip, port, args.udp_timeout)
-            service = get_service_name(port, "UDP")
-            
-            port_key = f"{port}/UDP"
-            scan_results["ports"][port_key] = { # UDP results are simpler for now
-                "protocol": "UDP", "status": status, "service": service
-            }
-            if "Open" in status: # Includes "Open" and "Open|Filtered"
-                 print(f"  UDP Port {port}: {status} - {service}")
-        elapsed_time_udp = time.monotonic() - start_time_udp
-        print(f"[+] UDP scan finished in {elapsed_time_udp:.2f}s.")
-    else:
-        print("\n[*] No UDP ports selected for scanning.")
 
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=40),
+            MofNCompleteColumn(),
+            TextColumn("[dim]ports[/]"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            udp_task = progress.add_task("UDP Scanning", total=len(final_udp_ports))
+
+            for port in final_udp_ports:
+                status = udp_scan_port(resolved_ip, port, args.udp_timeout)
+                service = get_service_name(port, "UDP")
+
+                port_key = f"{port}/UDP"
+                scan_results["ports"][port_key] = {
+                    "protocol": "UDP", "status": status, "service": service
+                }
+                if "Open" in status:
+                    status_style = "green" if status == "Open" else "yellow"
+                    console.print(f"  [{status_style}]\u25cf[/] UDP [bold]{port}[/] [{status_style}]{escape(status)}[/] \u2014 {escape(service)}")
+
+                progress.advance(udp_task)
+
+        elapsed_time_udp = time.monotonic() - start_time_udp
+        console.print(f"  [bold green]UDP scan finished[/] [dim]in {elapsed_time_udp:.2f}s[/]")
+        console.print()
+    else:
+        console.print("[dim]No UDP ports selected for scanning.[/]")
+        console.print()
 
     # --- Reporting ---
-    print("\n[+] Generating reports and summary...")
-    if args.json:
-        generate_json_report(scan_results, args.json)
-    if args.csv:
-        generate_csv_report(scan_results, args.csv)
-    if args.html:
-        generate_html_report(scan_results, args.html)
+    if args.json or args.csv or args.html:
+        console.print(Rule("[bold blue]Reports[/]", style="blue"))
+        if args.json:
+            generate_json_report(scan_results, args.json)
+        if args.csv:
+            generate_csv_report(scan_results, args.csv)
+        if args.html:
+            generate_html_report(scan_results, args.html)
+        console.print()
 
-    # Always print a summary to console
-    print(f"\n--- SocketSniper Scan Summary for {target_host} ({resolved_ip}) ---")
-    print(f"OS Guess: {scan_results['os_guess']}")
-    
-    open_ports_found = False
-    # Sort results for display: by port number, then by protocol (TCP before UDP if same port num)
+    # --- Summary Table ---
+    console.print(Rule(f"[bold blue]Scan Summary[/] [dim]\u2014 {escape(target_host)} ({resolved_ip})[/]", style="blue"))
+    console.print(f"  [bold]OS Guess:[/] {escape(scan_results['os_guess'])}")
+    console.print()
+
+    table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold white on dark_blue",
+        border_style="blue",
+        expand=True,
+    )
+    table.add_column("Port", style="bold", width=8, justify="right")
+    table.add_column("Protocol", width=10, justify="center")
+    table.add_column("Status", width=18)
+    table.add_column("Service", width=16)
+    table.add_column("Banner", max_width=45, overflow="ellipsis")
+    table.add_column("SSL/TLS", max_width=35)
+
     sorted_port_items = sorted(
         scan_results["ports"].items(),
         key=lambda item: (
-            int(item[0].split('/')[0]) if '/' in item[0] else int(item[0]), # Port number
-            item[1].get("protocol", "") # Protocol
+            int(item[0].split('/')[0]) if '/' in item[0] else int(item[0]),
+            item[1].get("protocol", "")
         )
     )
 
+    open_count = 0
+    closed_count = 0
+    filtered_count = 0
+
     for port_key, details in sorted_port_items:
-        if not isinstance(details, dict): continue
+        if not isinstance(details, dict):
+            continue
 
-        if "Open" in details.get("status", ""): # Covers "Open" and "Open|Filtered"
-            open_ports_found = True
-            print(f"  Port {port_key}: {details['status']} - Service: {details.get('service', 'N/A')}")
-            if details.get('banner') and details['banner'] != 'N/A':
-                print(f"    Banner: {details['banner'][:70]}{'...' if len(details['banner']) > 70 else ''}")
-            
-            if "ssl_tls" in details and isinstance(details["ssl_tls"], dict) and details["ssl_tls"].get("enabled"):
-                ssl_summary = details["ssl_tls"]
-                print(f"    SSL/TLS: Enabled")
-                if ssl_summary.get("negotiated_cipher_details"):
-                    nc = ssl_summary["negotiated_cipher_details"]
-                    print(f"      Cipher: {nc.get('name','N/A')} ({nc.get('protocol_version','N/A')})")
-                    if ssl_summary.get("negotiated_cipher_is_weak"):
-                        print("      WARNING: Negotiated cipher is potentially WEAK.")
-                
-                if ssl_summary.get("certificate") and isinstance(ssl_summary["certificate"], dict):
-                    cert_expired = ssl_summary["certificate"].get("expired")
-                    if cert_expired is True:
-                        print("      WARNING: Certificate EXPIRED! (NotAfter: {ssl_summary['certificate'].get('notAfter','N/A')})")
-                    elif cert_expired is False:
-                         print(f"      Certificate Valid (NotAfter: {ssl_summary['certificate'].get('notAfter','N/A')})")
+        status = details.get("status", "Unknown")
 
+        if status == "Open":
+            open_count += 1
+        elif "Closed" in status:
+            closed_count += 1
+        else:
+            filtered_count += 1
 
-                insec_protos = ssl_summary.get("insecure_protocols_supported", [])
-                if insec_protos:
-                    print(f"      WARNING: Insecure protocols supported: {', '.join(insec_protos)}")
-                
-                # weak_ciphers_list = ssl_summary.get("weak_ciphers_supported_by_server", [])
-                # if weak_ciphers_list and not ssl_summary.get("negotiated_cipher_is_weak"): # Avoid redundant if negotiated was already weak
-                #      print(f"      INFO: Server might support other weak ciphers: {', '.join(c.split('(')[0] for c in weak_ciphers_list if '(Negotiated' not in c)}")
+        # Only show open/open|filtered in the summary table
+        if "Open" not in status:
+            continue
 
+        # Status styling
+        if status == "Open":
+            status_text = Text("\u25cf Open", style="bold green")
+        elif "Open|Filtered" in status:
+            status_text = Text("\u25cf Open|Filtered", style="bold yellow")
+        else:
+            status_text = Text(status, style="bold red")
 
-                if ssl_summary.get("error"):
-                    print(f"      SSL Note/Error: {ssl_summary['error']}")
-            elif "ssl_tls" in details and isinstance(details["ssl_tls"], dict) and details["ssl_tls"].get("error"):
-                 print(f"    SSL/TLS Check Error: {details['ssl_tls']['error']}")
+        # Port number
+        port_num = port_key.split('/')[0] if '/' in port_key else port_key
 
+        # Protocol styling
+        protocol = details.get("protocol", "N/A")
+        proto_style = "cyan" if protocol == "TCP" else "magenta"
 
-    if not open_ports_found:
-        print("  No open or open|filtered ports found among scanned ports.")
+        # Banner
+        banner_val = details.get("banner", "N/A") or "-"
+        banner_text = Text(banner_val, style="dim")
 
+        # SSL/TLS column
+        ssl_text = Text("-", style="dim")
+        if "ssl_tls" in details and isinstance(details["ssl_tls"], dict):
+            ssl_data = details["ssl_tls"]
+            if ssl_data.get("enabled"):
+                nc = ssl_data.get("negotiated_cipher_details", {})
+                if nc:
+                    proto_ver = nc.get("protocol_version", "")
+                    is_weak = ssl_data.get("negotiated_cipher_is_weak", False)
+                    if is_weak:
+                        ssl_text = Text(f"\u26a0 {proto_ver}", style="bold red")
+                    elif "1.3" in proto_ver:
+                        ssl_text = Text(f"\u2713 {proto_ver}", style="bold green")
+                    elif "1.2" in proto_ver:
+                        ssl_text = Text(f"\u2713 {proto_ver}", style="green")
+                    else:
+                        ssl_text = Text(f"{proto_ver}", style="yellow")
+                else:
+                    ssl_text = Text("Enabled", style="green")
+            elif ssl_data.get("error"):
+                ssl_text = Text("Error", style="red")
 
-    print("\n--- Scan Complete ---")
+        table.add_row(
+            port_num,
+            Text(protocol, style=proto_style),
+            status_text,
+            details.get("service", "N/A"),
+            banner_text,
+            ssl_text,
+        )
+
+    if open_count + filtered_count > 0:
+        console.print(table)
+    else:
+        console.print("  [dim]No open or open|filtered ports found among scanned ports.[/]")
+
+    # Stats line
+    console.print()
+    total_scanned = open_count + closed_count + filtered_count
+    console.print(
+        f"  [bold green]{open_count}[/] open  "
+        f"[bold red]{closed_count}[/] closed  "
+        f"[bold yellow]{filtered_count}[/] filtered  "
+        f"[dim]({total_scanned} total)[/]"
+    )
+
+    # Detailed SSL info for ports that have it
+    ssl_ports = [
+        (pk, d) for pk, d in sorted_port_items
+        if isinstance(d, dict) and "ssl_tls" in d and isinstance(d["ssl_tls"], dict) and d["ssl_tls"].get("enabled")
+    ]
+    if ssl_ports:
+        console.print()
+        console.print(Rule("[bold blue]SSL/TLS Details[/]", style="blue"))
+        for port_key, details in ssl_ports:
+            ssl_data = details["ssl_tls"]
+            console.print(f"\n  [bold cyan]Port {port_key}[/]")
+
+            if ssl_data.get("negotiated_cipher_details"):
+                nc = ssl_data["negotiated_cipher_details"]
+                weak_marker = " [bold red]\u26a0 WEAK[/]" if ssl_data.get("negotiated_cipher_is_weak") else ""
+                console.print(f"    [bold]Cipher:[/]    {nc.get('name', 'N/A')} ({nc.get('protocol_version', 'N/A')}, {nc.get('secret_bits', 'N/A')} bits){weak_marker}")
+
+            if ssl_data.get("certificate") and isinstance(ssl_data["certificate"], dict):
+                cert = ssl_data["certificate"]
+                subject_cn = cert.get("subject", {}).get("commonName", "N/A")
+                issuer_cn = cert.get("issuer", {}).get("commonName", "N/A")
+                not_after = cert.get("notAfter", "N/A")
+                expired = cert.get("expired")
+                expired_str = ""
+                if expired is True:
+                    expired_str = " [bold red]EXPIRED[/]"
+                elif expired is False:
+                    expired_str = " [green]Valid[/]"
+                console.print(f"    [bold]Subject:[/]   {escape(str(subject_cn))}")
+                console.print(f"    [bold]Issuer:[/]    {escape(str(issuer_cn))}")
+                console.print(f"    [bold]Expires:[/]   {escape(str(not_after))}{expired_str}")
+
+            insec = ssl_data.get("insecure_protocols_supported", [])
+            if insec:
+                console.print(f"    [bold red]\u26a0 Insecure Protocols:[/] {', '.join(insec)}")
+
+            if ssl_data.get("error"):
+                console.print(f"    [yellow]Note:[/] {escape(ssl_data['error'])}")
+
+    console.print()
+    console.print(Rule("[bold green]Scan Complete[/]", style="green"))
 
 
 if __name__ == "__main__":
